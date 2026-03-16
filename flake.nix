@@ -12,7 +12,7 @@
     in {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
         pname = "t2fanrd";
-        version = "0.1.0";
+        version = "0.2.0";
         src = ./.;
         cargoHash = "sha256-FKQYiaOTZxD95AWD2zbVjENzMAPrFl/rzhwbkAgGbx0=";
       };
@@ -59,6 +59,13 @@
                     example = true;
                     description = "If true, the fan will be at max speed regardless of temperature.";
                   };
+
+                  sensors = lib.mkOption {
+                    type = lib.types.listOf lib.types.str;
+                    default = [];
+                    example = [ "amdgpu-pci-0b00" "amdgpu-pci-0e00" ];
+                    description = "List of lm_sensors chip names to monitor. If empty, uses default CPU/GPU temperature.";
+                  };
                 };
               });
               default = {};
@@ -78,6 +85,7 @@
                   high_temp = 70;
                   speed_curve = "linear";
                   always_full_speed = false;
+                  sensors = [ "amdgpu-pci-0b00" "amdgpu-pci-0e00" ];
                 };
               };'';
             };
@@ -117,7 +125,10 @@
                 SystemCallArchitectures = "native";
               };
             };
-            environment.etc."t2fand.conf".source = ((pkgs.formats.toml { }).generate "t2fand.conf" cfg.config);
+            environment.etc."t2fand.conf".source = ((pkgs.formats.toml { }).generate "t2fand.conf"
+              (lib.mapAttrs (_: fanCfg: fanCfg // lib.optionalAttrs (fanCfg.sensors != []) {
+                sensors = lib.concatStringsSep "," fanCfg.sensors;
+              }) cfg.config));
           };
         };
     };

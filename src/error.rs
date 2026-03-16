@@ -54,6 +54,9 @@ pub enum Error {
     #[error("Cannot write to fan controller")]
     FanWrite(#[source] std::io::Error),
 
+    #[error("Sensor {0} not found")]
+    SensorNotFound(String),
+
     #[error("Cannot setup shutdown signals")]
     Signal(#[source] std::io::Error),
 

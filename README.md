@@ -19,13 +19,14 @@ Initial configuration will be done automatically.
 
 For manual config, the config file can be found at `/etc/t2fand.conf`.
 
-There's four options for each fan.
+There's five options for each fan.
 |        Key        |                            Value                            |
 |:-----------------:|:-----------------------------------------------------------:|
 |      low_temp     |        Temperature that will trigger higher fan speed       |
 |     high_temp     |         Temperature that will trigger max fan speed         |
 |    speed_curve    |   Three options present. Will be explained in table below.  |
 | always_full_speed | if set "true", the fan will be at max speed no matter what. |
+|      sensors      | Comma-separated list of lm_sensors chip names to monitor. See below. |
 
 For `speed_curve`, there's three options.
 |     Key     |                   Value                   |
@@ -33,6 +34,21 @@ For `speed_curve`, there's three options.
 |    linear   |     Fan speed will be scaled linearly.    |
 | exponential |  Fan speed will be scaled exponentially.  |
 | logarithmic | Fan speed will be scaled logarithmically. |
+
+#### Custom Sensors
+By default, fan speed is based on CPU temperature (and GPU if present). The `sensors` key lets you specify additional lm_sensors chip names to monitor instead. The fan will respond to the highest "edge" temperature across all specified sensors.
+
+For example, to have a fan respond to two AMD GPUs:
+```ini
+[Fan1]
+low_temp=55
+high_temp=75
+speed_curve=linear
+always_full_speed=false
+sensors=amdgpu-pci-0b00,amdgpu-pci-0e00
+```
+
+You can find available sensor names by running `sensors` (from the `lm_sensors` package). If `sensors` is omitted or empty, the fan uses the default CPU/GPU temperature.
 
 Here's an image to better explain this. (Red: linear, blue: exponential, green: logarithmic)
 ![Image of fan curve graphs](https://user-images.githubusercontent.com/39993457/233580720-cfdaba12-a2d8-430c-87a2-15209dcfec6d.png)
