@@ -1,9 +1,24 @@
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::{Read, Seek, Write},
+    path::PathBuf,
+};
 
 use crate::{
     config::{FanConfig, SpeedCurve},
     error::{Error, Result},
 };
+
+pub(crate) fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut String) -> Result<u8> {
+    temp_file
+        .read_to_string(temp_buf)
+        .map_err(Error::TempRead)?;
+
+    temp_file.rewind().map_err(Error::TempSeek)?;
+
+    let temp = temp_buf.trim_end().parse::<u32>().map_err(Error::TempParse);
+    temp_buf.clear();
+    temp.map(|t| (t / 1000) as u8)
+}
 
 #[derive(Debug)]
 pub struct FanController {
@@ -13,10 +28,11 @@ pub struct FanController {
 
     min_speed: u32,
     max_speed: u32,
+    sensor_files: Vec<std::fs::File>,
 }
 
 impl FanController {
-    pub fn new(path: PathBuf, config: FanConfig) -> Result<Self> {
+    pub fn new(path: PathBuf, config: FanConfig, sensor_files: Vec<std::fs::File>) -> Result<Self> {
         fn join_suffix(mut path: PathBuf, suffix: &str) -> PathBuf {
             let file_name = path.file_name().unwrap().to_str().unwrap();
             path.set_file_name(format!("{file_name}{suffix}"));
@@ -52,10 +68,26 @@ impl FanController {
             config,
             min_speed,
             max_speed,
+            sensor_files,
         };
 
         println!("Found fan: {this:#?}");
         Ok(this)
+    }
+
+    /// Read the maximum temperature across all custom sensors for this fan.
+    /// Returns `None` if no custom sensors are configured (use default CPU/GPU temp).
+    pub fn read_sensor_temp(&mut self, temp_buf: &mut String) -> Result<Option<u8>> {
+        if self.sensor_files.is_empty() {
+            return Ok(None);
+        }
+
+        let mut max_temp = 0u8;
+        for sensor_file in &mut self.sensor_files {
+            let temp = read_temp_file(sensor_file, temp_buf)?;
+            max_temp = max_temp.max(temp);
+        }
+        Ok(Some(max_temp))
     }
 
     pub fn set_manual(&self, enabled: bool) -> Result<()> {

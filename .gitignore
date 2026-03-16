@@ -4,3 +4,4 @@ target
 *.py
 .vscode
 /result
+.DS_Store

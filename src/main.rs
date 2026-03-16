@@ -10,14 +10,14 @@
 )]
 
 use std::{
-    io::{ErrorKind, Read, Seek},
+    io::ErrorKind,
     path::PathBuf,
     process::ExitCode,
     sync::{atomic::AtomicBool, Arc},
 };
 
 use arraydeque::ArrayDeque;
-use fan_controller::FanController;
+use fan_controller::{read_temp_file, FanController};
 use nonempty::NonEmpty as NonEmptyVec;
 use signal_hook::consts::{SIGINT, SIGTERM};
 
@@ -85,18 +85,6 @@ fn check_pid_file() -> Result<()> {
     std::fs::write(PID_FILE, current_pid).map_err(Error::PidWrite)
 }
 
-fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut String) -> Result<u8> {
-    temp_file
-        .read_to_string(temp_buf)
-        .map_err(Error::TempRead)?;
-
-    temp_file.rewind().map_err(Error::TempSeek)?;
-
-    let temp = temp_buf.trim_end().parse::<u32>().map_err(Error::TempParse);
-    temp_buf.clear();
-    temp.map(|t| (t / 1000) as u8)
-}
-
 fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<std::fs::File> {
     for temp_path_res in temps {
         let Ok(temp_path) = temp_path_res else {
@@ -127,6 +115,55 @@ fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
     Ok(find_temp_file(temps, temp_buf))
 }
 
+/// Construct an lm_sensors-compatible chip name from a hwmon driver name and
+/// the canonicalized device path.
+///
+/// For a PCI device at `/sys/devices/pci0000:00/.../0000:0b:00.0`, with driver
+/// name `amdgpu`, this returns `amdgpu-pci-0b00`.
+fn construct_chip_name(driver_name: &str, device_path: &std::path::Path) -> Option<String> {
+    let device_name = device_path.file_name()?.to_str()?;
+    // Parse PCI address: DDDD:BB:DD.F
+    let parts: Vec<&str> = device_name.split(':').collect();
+    if parts.len() == 3 {
+        let bus = parts[1]; // e.g. "0b"
+        let dev_func = parts[2]; // e.g. "00.0"
+        let dev = dev_func.split('.').next()?; // e.g. "00"
+        Some(format!("{driver_name}-pci-{bus}{dev}"))
+    } else {
+        None
+    }
+}
+
+/// Find the hwmon temp1_input file for a given lm_sensors-style sensor name
+/// (e.g. `amdgpu-pci-0b00`).
+fn find_hwmon_sensor(sensor_name: &str) -> Result<std::fs::File> {
+    let hwmon_paths = glob::glob("/sys/class/hwmon/hwmon*")?;
+    for hwmon_path in hwmon_paths.filter_map(std::result::Result::ok) {
+        let name_path = hwmon_path.join("name");
+        let Ok(name) = std::fs::read_to_string(&name_path) else {
+            continue;
+        };
+        let name = name.trim();
+
+        let device_path = hwmon_path.join("device");
+        if let Ok(real_path) = std::fs::canonicalize(&device_path) {
+            if let Some(chip_name) = construct_chip_name(name, &real_path) {
+                if chip_name == sensor_name {
+                    let temp_input = hwmon_path.join("temp1_input");
+                    return std::fs::File::open(temp_input).map_err(Error::TempRead);
+                }
+            }
+        }
+    }
+
+    Err(Error::SensorNotFound(sensor_name.to_owned()))
+}
+
+/// Resolve a list of sensor names to open file handles for their temp1_input files.
+fn find_sensor_temp_files(sensor_names: &[String]) -> Result<Vec<std::fs::File>> {
+    sensor_names.iter().map(|name| find_hwmon_sensor(name)).collect()
+}
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
@@ -137,49 +174,67 @@ fn main() -> ExitCode {
     }
 }
 
+struct FanTempTracker {
+    temps: ArrayDeque<u8, 50, arraydeque::Wrapping>,
+    last_mean: u16,
+}
+
 fn start_temp_loop(
     mut temp_buffer: String,
     mut cpu_temp_file: std::fs::File,
     mut gpu_temp_file: Option<std::fs::File>,
-    fans: &NonEmptyVec<FanController>,
+    fans: &mut NonEmptyVec<FanController>,
 ) -> Result<()> {
     let cancellation_token = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, cancellation_token.clone()).map_err(Error::Signal)?;
     signal_hook::flag::register(SIGTERM, cancellation_token.clone()).map_err(Error::Signal)?;
 
-    let mut last_temp = 0;
-    let mut temps = ArrayDeque::<u8, 50, arraydeque::Wrapping>::new();
+    let mut trackers: Vec<FanTempTracker> = fans
+        .iter()
+        .map(|_| FanTempTracker {
+            temps: ArrayDeque::new(),
+            last_mean: 0,
+        })
+        .collect();
+
     while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
         let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
-        let temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
+        let default_temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
             let gpu_temp = read_temp_file(gpu_temp_file, &mut temp_buffer)?;
-            if gpu_temp > cpu_temp {
-                gpu_temp
-            } else {
-                cpu_temp
-            }
+            gpu_temp.max(cpu_temp)
         } else {
             cpu_temp
         };
 
-        temps.push_back(temp);
+        let mut any_changed = false;
+        for (fan, tracker) in fans.iter_mut().zip(trackers.iter_mut()) {
+            let fan_temp = if let Some(sensor_temp) = fan.read_sensor_temp(&mut temp_buffer)? {
+                sensor_temp
+            } else {
+                default_temp
+            };
 
-        let sum_temp: u16 = temps.iter().map(|t| *t as u16).sum();
-        let mean_temp = sum_temp / (temps.len() as u16);
-        if mean_temp == last_temp {
-            // Avoid messing up the mean due to the longer sleep.
-            for _ in 0..9 {
-                temps.push_back(temp);
-            }
+            tracker.temps.push_back(fan_temp);
 
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        } else {
-            last_temp = mean_temp;
-            for fan in fans {
+            let sum_temp: u16 = tracker.temps.iter().map(|t| *t as u16).sum();
+            let mean_temp = sum_temp / (tracker.temps.len() as u16);
+
+            if mean_temp != tracker.last_mean {
+                tracker.last_mean = mean_temp;
                 fan.set_speed(fan.calc_speed(mean_temp as u8))?;
+                any_changed = true;
+            } else {
+                // Avoid messing up the mean due to the longer sleep.
+                for _ in 0..9 {
+                    tracker.temps.push_back(fan_temp);
+                }
             }
+        }
 
+        if any_changed {
             std::thread::sleep(std::time::Duration::from_millis(100));
+        } else {
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
 
@@ -196,7 +251,20 @@ fn real_main() -> Result<()> {
     let mut temp_buffer = String::new();
 
     let fan_paths = find_fan_paths()?;
-    let fans = load_fan_configs(fan_paths)?;
+    let fan_count = fan_paths.len_nonzero();
+    let configs = load_fan_configs(fan_count)?;
+
+    let fans: Vec<FanController> = fan_paths
+        .into_iter()
+        .zip(configs)
+        .map(|(path, config)| {
+            let sensor_files = find_sensor_temp_files(&config.sensors)?;
+            FanController::new(path, config, sensor_files)
+        })
+        .collect::<Result<_>>()?;
+
+    let mut fans = NonEmptyVec::from_vec(fans).ok_or(Error::NoFan)?;
+
     let cpu_temp_file = find_cpu_temp_file(&mut temp_buffer)?;
     let gpu_temp_file = find_gpu_temp_file(&mut temp_buffer)?;
 
@@ -205,9 +273,9 @@ fn real_main() -> Result<()> {
         fan.set_manual(true)?;
     }
 
-    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_file, &fans);
+    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_file, &mut fans);
     println!("T2 Fan Daemon is shutting down...");
-    for fan in fans {
+    for fan in &fans {
         fan.set_manual(false)?;
     }
 

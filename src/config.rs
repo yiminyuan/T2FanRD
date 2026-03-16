@@ -1,8 +1,6 @@
-use std::{io::ErrorKind, num::NonZeroUsize, path::PathBuf, str::FromStr};
+use std::{io::ErrorKind, num::NonZeroUsize, str::FromStr};
 
-use nonempty::NonEmpty as NonEmptyVec;
-
-use crate::{fan_controller::FanController, Error, Result};
+use crate::{Error, Result};
 
 #[cfg(debug_assertions)]
 const CONFIG_FILE: &str = "./t2fand.conf";
@@ -38,24 +36,30 @@ impl FromStr for SpeedCurve {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FanConfig {
     pub low_temp: u8,
     pub high_temp: u8,
     pub speed_curve: SpeedCurve,
     pub always_full_speed: bool,
+    pub sensors: Vec<String>,
 }
 
 impl FanConfig {
     fn write_property<'a>(
-        self,
+        &self,
         setter: &'a mut ini::SectionSetter<'a>,
     ) -> &'a mut ini::SectionSetter<'a> {
-        setter
+        let s = setter
             .set("low_temp", self.low_temp.to_string())
             .set("high_temp", self.high_temp.to_string())
             .set("speed_curve", self.speed_curve.to_string())
-            .set("always_full_speed", self.always_full_speed.to_string())
+            .set("always_full_speed", self.always_full_speed.to_string());
+        if !self.sensors.is_empty() {
+            s.set("sensors", self.sensors.join(","))
+        } else {
+            s
+        }
     }
 }
 
@@ -66,6 +70,7 @@ impl Default for FanConfig {
             high_temp: 75,
             speed_curve: SpeedCurve::Linear,
             always_full_speed: false,
+            sensors: Vec::new(),
         }
     }
 }
@@ -81,11 +86,22 @@ impl TryFrom<&ini::Properties> for FanConfig {
                 .map_err(|_| Error::InvalidConfigValue(key))
         }
 
+        let sensors = properties
+            .get("sensors")
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             low_temp: get_value(properties, "low_temp")?,
             high_temp: get_value(properties, "high_temp")?,
             speed_curve: get_value(properties, "speed_curve")?,
             always_full_speed: get_value(properties, "always_full_speed")?,
+            sensors,
         })
     }
 }
@@ -110,10 +126,11 @@ fn generate_config_file(fan_count: NonZeroUsize) -> Result<Vec<FanConfig>> {
     let mut configs = Vec::with_capacity(fan_count.get());
     for i in 1..=fan_count.get() {
         let config = FanConfig::default();
-        configs.push(config);
 
         let mut setter = config_file.with_section(Some(format!("Fan{i}")));
         config.write_property(&mut setter);
+
+        configs.push(config);
     }
 
     config_file
@@ -123,19 +140,10 @@ fn generate_config_file(fan_count: NonZeroUsize) -> Result<Vec<FanConfig>> {
     Ok(configs)
 }
 
-pub fn load_fan_configs(fan_paths: NonEmptyVec<PathBuf>) -> Result<NonEmptyVec<FanController>> {
-    let fan_count = fan_paths.len_nonzero();
-    let configs = match std::fs::read_to_string(CONFIG_FILE) {
-        Ok(file_raw) => parse_config_file(&file_raw, fan_count)?,
-        Err(err) if err.kind() == ErrorKind::NotFound => generate_config_file(fan_count)?,
-        Err(err) => return Err(Error::ConfigRead(err)),
-    };
-
-    let fans = fan_paths
-        .into_iter()
-        .zip(configs)
-        .map(|(path, config)| FanController::new(path, config))
-        .collect::<Result<_>>()?;
-
-    Ok(NonEmptyVec::from_vec(fans).unwrap())
+pub fn load_fan_configs(fan_count: NonZeroUsize) -> Result<Vec<FanConfig>> {
+    match std::fs::read_to_string(CONFIG_FILE) {
+        Ok(file_raw) => parse_config_file(&file_raw, fan_count),
+        Err(err) if err.kind() == ErrorKind::NotFound => generate_config_file(fan_count),
+        Err(err) => Err(Error::ConfigRead(err)),
+    }
 }
