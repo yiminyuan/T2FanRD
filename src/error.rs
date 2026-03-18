@@ -11,7 +11,7 @@ pub enum Error {
     TempRead(#[source] std::io::Error),
     #[error("Temperature sensor cannot be seeked")]
     TempSeek(#[source] std::io::Error),
-    #[error("Temporature sensor cannot be parsed")]
+    #[error("Temperature sensor cannot be parsed")]
     TempParse(#[source] std::num::ParseIntError),
 
     #[error("Cannot read minimum fan speed")]

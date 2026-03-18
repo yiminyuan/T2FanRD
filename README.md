@@ -50,6 +50,9 @@ sensors=amdgpu-pci-0b00,amdgpu-pci-0e00
 
 You can find available sensor names by running `sensors` (from the `lm_sensors` package). If `sensors` is omitted or empty, the fan uses the default CPU/GPU temperature.
 
+#### Mac Pro 2019 (MacPro7,1)
+The Mac Pro 2019 has no integrated GPU. When t2fanrd detects a MacPro7,1 (via `/sys/class/dmi/id/product_name`), it automatically skips the integrated GPU temperature sensor lookup. Use the `sensors` key on each fan to monitor discrete GPU temperatures instead.
+
 Here's an image to better explain this. (Red: linear, blue: exponential, green: logarithmic)
 ![Image of fan curve graphs](https://user-images.githubusercontent.com/39993457/233580720-cfdaba12-a2d8-430c-87a2-15209dcfec6d.png)
 
