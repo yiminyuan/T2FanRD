@@ -111,6 +111,15 @@ fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
 }
 
 fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
+    // The Mac Pro 2019 (MacPro7,1) has no integrated GPU; its discrete GPUs
+    // are handled via the per-fan `sensors` config instead.
+    if let Ok(product_name) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
+        if product_name.trim() == "MacPro7,1" {
+            println!("MacPro7,1 detected, skipping integrated GPU temperature sensor");
+            return Ok(None);
+        }
+    }
+
     let temps = glob::glob("/sys/class/drm/card0/device/hwmon/hwmon*/temp1_input")?;
     Ok(find_temp_file(temps, temp_buf))
 }
