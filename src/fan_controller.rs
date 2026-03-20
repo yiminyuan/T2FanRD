@@ -132,7 +132,8 @@ impl FanController {
                     + self.min_speed
             }
             SpeedCurve::Exponential => {
-                ((temp - low_temp).pow(3) as f32 / (high_temp - low_temp).pow(3) as f32
+                let exp = self.config.exp_pow;
+                ((temp - low_temp).pow(exp) as f32 / (high_temp - low_temp).pow(exp) as f32
                     * (self.max_speed - self.min_speed) as f32) as u32
                     + self.min_speed
             }

@@ -43,6 +43,9 @@ pub struct FanConfig {
     pub speed_curve: SpeedCurve,
     pub always_full_speed: bool,
     pub sensors: Vec<String>,
+    /// Exponent for the exponential speed curve. Only used when
+    /// `speed_curve` is `Exponential`. Defaults to 3.
+    pub exp_pow: u32,
 }
 
 impl FanConfig {
@@ -50,16 +53,18 @@ impl FanConfig {
         &self,
         setter: &'a mut ini::SectionSetter<'a>,
     ) -> &'a mut ini::SectionSetter<'a> {
-        let s = setter
+        let mut s = setter
             .set("low_temp", self.low_temp.to_string())
             .set("high_temp", self.high_temp.to_string())
             .set("speed_curve", self.speed_curve.to_string())
             .set("always_full_speed", self.always_full_speed.to_string());
         if !self.sensors.is_empty() {
-            s.set("sensors", self.sensors.join(","))
-        } else {
-            s
+            s = s.set("sensors", self.sensors.join(","));
         }
+        if matches!(self.speed_curve, SpeedCurve::Exponential) && self.exp_pow != 3 {
+            s = s.set("exp_pow", self.exp_pow.to_string());
+        }
+        s
     }
 }
 
@@ -71,6 +76,7 @@ impl Default for FanConfig {
             speed_curve: SpeedCurve::Linear,
             always_full_speed: false,
             sensors: Vec::new(),
+            exp_pow: 3,
         }
     }
 }
@@ -96,12 +102,19 @@ impl TryFrom<&ini::Properties> for FanConfig {
             })
             .unwrap_or_default();
 
+        let exp_pow = properties
+            .get("exp_pow")
+            .map(|s| s.parse().map_err(|_| Error::InvalidConfigValue("exp_pow")))
+            .transpose()?
+            .unwrap_or(3);
+
         Ok(Self {
             low_temp: get_value(properties, "low_temp")?,
             high_temp: get_value(properties, "high_temp")?,
             speed_curve: get_value(properties, "speed_curve")?,
             always_full_speed: get_value(properties, "always_full_speed")?,
             sensors,
+            exp_pow,
         })
     }
 }
