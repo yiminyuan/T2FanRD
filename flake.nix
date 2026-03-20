@@ -12,7 +12,7 @@
     in {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
         pname = "t2fanrd";
-        version = "0.3.0";
+        version = "0.4.0";
         src = ./.;
         cargoHash = "sha256-FKQYiaOTZxD95AWD2zbVjENzMAPrFl/rzhwbkAgGbx0=";
       };
@@ -63,8 +63,8 @@
                   sensors = lib.mkOption {
                     type = lib.types.listOf lib.types.str;
                     default = [];
-                    example = [ "amdgpu-pci-0b00" "amdgpu-pci-0e00" ];
-                    description = "List of lm_sensors chip names to monitor. If empty, uses default CPU/GPU temperature.";
+                    example = [ "slot:1" ];
+                    description = "List of sensor specifiers to monitor. Use 'slot:N' for physical PCIe slot N, or an lm_sensors chip name. If empty, uses default CPU/GPU temperature.";
                   };
                 };
               });
@@ -85,7 +85,7 @@
                   high_temp = 70;
                   speed_curve = "linear";
                   always_full_speed = false;
-                  sensors = [ "amdgpu-pci-0b00" "amdgpu-pci-0e00" ];
+                  sensors = [ "slot:1" ];
                 };
               };'';
             };

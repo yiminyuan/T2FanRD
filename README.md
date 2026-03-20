@@ -26,7 +26,7 @@ There's five options for each fan.
 |     high_temp     |         Temperature that will trigger max fan speed         |
 |    speed_curve    |   Three options present. Will be explained in table below.  |
 | always_full_speed | if set "true", the fan will be at max speed no matter what. |
-|      sensors      | Comma-separated list of lm_sensors chip names to monitor. See below. |
+|      sensors      | Comma-separated list of sensor specifiers to monitor. See below. |
 
 For `speed_curve`, there's three options.
 |     Key     |                   Value                   |
@@ -36,22 +36,35 @@ For `speed_curve`, there's three options.
 | logarithmic | Fan speed will be scaled logarithmically. |
 
 #### Custom Sensors
-By default, fan speed is based on CPU temperature (and GPU if present). The `sensors` key lets you specify additional lm_sensors chip names to monitor instead. The fan will respond to the highest "edge" temperature across all specified sensors.
+By default, fan speed is based on CPU temperature (and GPU if present). The `sensors` key lets you specify sensor specifiers to monitor instead. The fan will respond to the highest temperature across all matched sensors.
 
-For example, to have a fan respond to two AMD GPUs:
+Two formats are supported:
+
+- **`slot:<N>`** — Monitor all temperature sensors under physical PCIe slot N (read from `/sys/bus/pci/slots/`). This is the recommended approach because it is stable across PCIe topology changes (e.g. adding or removing a PCIe card won't shift PCI bus addresses and break your config). You can find physical slot numbers with `ls /sys/bus/pci/slots/`.
+
+- **`<chip-name>`** — An exact lm_sensors chip name (e.g. `amdgpu-pci-0b00`). You can find these by running `sensors` (from the `lm_sensors` package). Note that PCI bus addresses may change when installing or removing PCIe cards.
+
+If `sensors` is omitted or empty, the fan uses the default CPU/GPU temperature.
+
+#### Mac Pro 2019 (MacPro7,1)
+The Mac Pro 2019 has no integrated GPU. When t2fanrd detects a MacPro7,1 (via `/sys/class/dmi/id/product_name`), it automatically skips the integrated GPU temperature sensor lookup. Use the `sensors` key on each fan to monitor discrete GPU temperatures instead.
+
+Example config for a Mac Pro 2019 with dual W6800X Duo MPX modules in slots 1 and 3:
 ```ini
-[Fan1]
+[Fan2]
 low_temp=55
 high_temp=75
 speed_curve=linear
 always_full_speed=false
-sensors=amdgpu-pci-0b00,amdgpu-pci-0e00
+sensors=slot:1
+
+[Fan3]
+low_temp=55
+high_temp=75
+speed_curve=linear
+always_full_speed=false
+sensors=slot:3
 ```
-
-You can find available sensor names by running `sensors` (from the `lm_sensors` package). If `sensors` is omitted or empty, the fan uses the default CPU/GPU temperature.
-
-#### Mac Pro 2019 (MacPro7,1)
-The Mac Pro 2019 has no integrated GPU. When t2fanrd detects a MacPro7,1 (via `/sys/class/dmi/id/product_name`), it automatically skips the integrated GPU temperature sensor lookup. Use the `sensors` key on each fan to monitor discrete GPU temperatures instead.
 
 Here's an image to better explain this. (Red: linear, blue: exponential, green: logarithmic)
 ![Image of fan curve graphs](https://user-images.githubusercontent.com/39993457/233580720-cfdaba12-a2d8-430c-87a2-15209dcfec6d.png)

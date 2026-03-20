@@ -168,9 +168,100 @@ fn find_hwmon_sensor(sensor_name: &str) -> Result<std::fs::File> {
     Err(Error::SensorNotFound(sensor_name.to_owned()))
 }
 
-/// Resolve a list of sensor names to open file handles for their temp1_input files.
+/// Read all PCI addresses associated with a physical PCIe slot and its
+/// sub-slots from `/sys/bus/pci/slots/`.
+///
+/// For slot `"1"`, this reads addresses from slots named `1`, `1-1`, `1-2`,
+/// etc. The addresses are in `DDDD:BB:DD` format (no function number).
+fn read_slot_addresses(slot: &str) -> Result<Vec<String>> {
+    let mut addresses = Vec::new();
+
+    let main_addr_path = format!("/sys/bus/pci/slots/{slot}/address");
+    match std::fs::read_to_string(&main_addr_path) {
+        Ok(addr) => addresses.push(addr.trim().to_owned()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(Error::SensorNotFound(format!("slot:{slot}")));
+        }
+        Err(err) => return Err(Error::TempRead(err)),
+    }
+
+    // Also read sub-slot addresses (slot-1, slot-2, etc.)
+    let pattern = format!("/sys/bus/pci/slots/{slot}-*/address");
+    for path in glob::glob(&pattern)?.filter_map(std::result::Result::ok) {
+        if let Ok(addr) = std::fs::read_to_string(&path) {
+            addresses.push(addr.trim().to_owned());
+        }
+    }
+
+    Ok(addresses)
+}
+
+/// Find all hwmon temp1_input files for devices downstream of a physical PCIe
+/// slot. The slot number corresponds to entries in `/sys/bus/pci/slots/`.
+///
+/// This matches by checking whether the hwmon device's canonical sysfs path
+/// passes through any PCI address owned by the slot or its sub-slots.
+fn find_slot_temp_files(slot: &str) -> Result<Vec<std::fs::File>> {
+    let addresses = read_slot_addresses(slot)?;
+    let mut files = Vec::new();
+
+    let hwmon_paths = glob::glob("/sys/class/hwmon/hwmon*")?;
+    for hwmon_path in hwmon_paths.filter_map(std::result::Result::ok) {
+        let temp_input = hwmon_path.join("temp1_input");
+        if !temp_input.exists() {
+            continue;
+        }
+
+        let device_path = hwmon_path.join("device");
+        let Ok(real_path) = std::fs::canonicalize(&device_path) else {
+            continue;
+        };
+
+        let real_path_str = real_path.to_string_lossy();
+
+        // Check if any path component matches a slot address.
+        // Slot addresses are "DDDD:BB:DD" (no function), sysfs path components
+        // are "DDDD:BB:DD.F" (with function), so we match the component prefix.
+        let is_downstream = addresses.iter().any(|addr| {
+            real_path_str.split('/').any(|component| {
+                component.starts_with(addr.as_str())
+                    && component
+                        .as_bytes()
+                        .get(addr.len())
+                        .map_or(true, |&b| b == b'.')
+            })
+        });
+
+        if is_downstream {
+            if let Ok(file) = std::fs::File::open(&temp_input) {
+                files.push(file);
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Err(Error::SensorNotFound(format!("slot:{slot}")));
+    }
+
+    Ok(files)
+}
+
+/// Resolve a list of sensor specifiers to open file handles for their
+/// temp1_input files.
+///
+/// Supported formats:
+/// - `slot:<N>` — all temperature sensors under physical PCIe slot N
+/// - `<chip-name>` — exact lm_sensors chip name (e.g. `amdgpu-pci-0b00`)
 fn find_sensor_temp_files(sensor_names: &[String]) -> Result<Vec<std::fs::File>> {
-    sensor_names.iter().map(|name| find_hwmon_sensor(name)).collect()
+    let mut files = Vec::new();
+    for name in sensor_names {
+        if let Some(slot) = name.strip_prefix("slot:") {
+            files.extend(find_slot_temp_files(slot)?);
+        } else {
+            files.push(find_hwmon_sensor(name)?);
+        }
+    }
+    Ok(files)
 }
 
 fn main() -> ExitCode {
