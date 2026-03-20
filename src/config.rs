@@ -44,8 +44,8 @@ pub struct FanConfig {
     pub always_full_speed: bool,
     pub sensors: Vec<String>,
     /// Exponent for the exponential speed curve. Only used when
-    /// `speed_curve` is `Exponential`. Defaults to 3.
-    pub exp_pow: u32,
+    /// `speed_curve` is `Exponential`. Defaults to 3.0.
+    pub exp_pow: f32,
 }
 
 impl FanConfig {
@@ -61,7 +61,8 @@ impl FanConfig {
         if !self.sensors.is_empty() {
             s = s.set("sensors", self.sensors.join(","));
         }
-        if matches!(self.speed_curve, SpeedCurve::Exponential) && self.exp_pow != 3 {
+        #[allow(clippy::float_cmp)]
+        if matches!(self.speed_curve, SpeedCurve::Exponential) && self.exp_pow != 3.0 {
             s = s.set("exp_pow", self.exp_pow.to_string());
         }
         s
@@ -76,7 +77,7 @@ impl Default for FanConfig {
             speed_curve: SpeedCurve::Linear,
             always_full_speed: false,
             sensors: Vec::new(),
-            exp_pow: 3,
+            exp_pow: 3.0,
         }
     }
 }
@@ -106,7 +107,7 @@ impl TryFrom<&ini::Properties> for FanConfig {
             .get("exp_pow")
             .map(|s| s.parse().map_err(|_| Error::InvalidConfigValue("exp_pow")))
             .transpose()?
-            .unwrap_or(3);
+            .unwrap_or(3.0);
 
         Ok(Self {
             low_temp: get_value(properties, "low_temp")?,
