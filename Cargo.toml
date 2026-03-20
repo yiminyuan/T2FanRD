@@ -1,10 +1,10 @@
 [package]
 name = "t2fanrd"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "Simple Fan Daemon for T2 Macs"
-repository = "https://github.com/GnomedDev/T2FanRD"
+description = "Fan Daemon for the Mac Pro 2019 (MacPro7,1)"
+repository = "https://github.com/yiminyuan/T2FanRD"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

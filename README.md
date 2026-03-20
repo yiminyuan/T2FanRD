@@ -1,21 +1,16 @@
 # T2FanRD
 
-Simple Fan Daemon for T2 Macs, rewritten from the [original Python version](https://github.com/NoaHimesaka1873/t2fand).
+Fan Daemon for the Mac Pro 2019 (MacPro7,1), based on the [original version](https://github.com/GnomedDev/T2FanRD).
 
 ## Compilation
 `cargo build --release`
 
 ## Installation
-### Standard
 1. Copy the `target/release/t2fanrd` executable to wherever your distro wants executables to be run by root.
 2. Setup the executable to be run automatically at startup, like via a [systemd service](https://github.com/t2linux/fedora/blob/2947fdc909a35f04eb936a4f9c0f33fe4e52d9c2/t2fanrd/t2fanrd.service).
 
-### NixOS
-Add this repo to your flake inputs, and the module `<name-of-input>.nixosModule.t2fanrd` to your imports.
-
 ## Configuration
-### Standard
-Initial configuration will be done automatically.
+Initial configuration will be done automatically on first run.
 
 For manual config, the config file can be found at `/etc/t2fand.conf`.
 
@@ -26,7 +21,7 @@ There's five options for each fan.
 |     high_temp     |         Temperature that will trigger max fan speed         |
 |    speed_curve    |   Three options present. Will be explained in table below.  |
 | always_full_speed | if set "true", the fan will be at max speed no matter what. |
-|      sensors      | Comma-separated list of sensor specifiers to monitor. See below. |
+|      sensors      | Comma-separated list of `slot:<N>` specifiers. See below.   |
 
 For `speed_curve`, there's three options.
 |     Key     |                   Value                   |
@@ -35,43 +30,50 @@ For `speed_curve`, there's three options.
 | exponential |  Fan speed will be scaled exponentially.  |
 | logarithmic | Fan speed will be scaled logarithmically. |
 
-#### Custom Sensors
-By default, fan speed is based on CPU temperature (and GPU if present). The `sensors` key lets you specify sensor specifiers to monitor instead. The fan will respond to the highest temperature across all matched sensors.
-
-Two formats are supported:
-
-- **`slot:<N>`** — Monitor all temperature sensors under physical PCIe slot N (read from `/sys/bus/pci/slots/`). This is the recommended approach because it is stable across PCIe topology changes (e.g. adding or removing a PCIe card won't shift PCI bus addresses and break your config). You can find physical slot numbers with `ls /sys/bus/pci/slots/`.
-
-- **`<chip-name>`** — An exact lm_sensors chip name (e.g. `amdgpu-pci-0b00`). You can find these by running `sensors` (from the `lm_sensors` package). Note that PCI bus addresses may change when installing or removing PCIe cards.
-
-If `sensors` is omitted or empty, the fan uses the default CPU/GPU temperature.
-
-#### Mac Pro 2019 (MacPro7,1)
-The Mac Pro 2019 has no integrated GPU. When t2fanrd detects a MacPro7,1 (via `/sys/class/dmi/id/product_name`), it automatically skips the integrated GPU temperature sensor lookup. Use the `sensors` key on each fan to monitor discrete GPU temperatures instead.
-
-Example config for a Mac Pro 2019 with dual W6800X Duo MPX modules in slots 1 and 3:
-```ini
-[Fan2]
-low_temp=55
-high_temp=75
-speed_curve=linear
-always_full_speed=false
-sensors=slot:1
-
-[Fan3]
-low_temp=55
-high_temp=75
-speed_curve=linear
-always_full_speed=false
-sensors=slot:3
-```
-
 Here's an image to better explain this. (Red: linear, blue: exponential, green: logarithmic)
 ![Image of fan curve graphs](https://user-images.githubusercontent.com/39993457/233580720-cfdaba12-a2d8-430c-87a2-15209dcfec6d.png)
 
-### NixOS
-Find out how many fans you have (using lm_sensors for example, as in: `$ nix-shell -p lm_sensors --run "sensors | grep fan"`).
+### Sensors
+By default, fan speed is based on CPU temperature. The `sensors` key lets you assign PCIe slot-based temperature sensors to individual fans. The fan will respond to the highest temperature across all sensors matched under the specified slots.
 
-Configure each fan with `services.t2fanrd.config.<name-of-fan>` using the options from the Standard configuration above. See the example declared with the option in the flake.
+Use the `slot:<N>` format, where `<N>` is a physical PCIe slot number as exposed in `/sys/bus/pci/slots/`. This is stable across PCIe topology changes — adding or removing a PCIe card won't shift PCI bus addresses and break your config.
 
-Start the systemd service with `services.t2fanrd.enable = true;`.
+You can find physical slot numbers with:
+```
+ls /sys/bus/pci/slots/
+```
+
+### Example
+Config for a Mac Pro 2019 with dual W6800X Duo MPX modules in slots 1 and 3. Fan 2 is assigned to the MPX module in slot 1, and Fan 3 to the MPX module in slot 3. Each slot contains two GPU dies, and the fan responds to whichever die is hotter.
+
+```ini
+# Rear exhaust fan
+[Fan1]
+low_temp=55
+high_temp=80
+speed_curve=exponential
+always_full_speed=false
+
+# Front intake fan - bottom
+[Fan2]
+low_temp=55
+high_temp=80
+speed_curve=exponential
+always_full_speed=false
+sensors=slot:1
+
+# Front intake fan - middle
+[Fan3]
+low_temp=55
+high_temp=80
+speed_curve=exponential
+always_full_speed=false
+sensors=slot:3
+
+# Front intake fan - top
+[Fan4]
+low_temp=55
+high_temp=80
+speed_curve=exponential
+always_full_speed=false
+```
