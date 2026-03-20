@@ -22,7 +22,7 @@ There's six options for each fan.
 |    speed_curve    |   Three options present. Will be explained in table below.  |
 | always_full_speed | if set "true", the fan will be at max speed no matter what. |
 |      sensors      | Comma-separated list of `slot:<N>` specifiers. See below.   |
-|      exp_pow      | Exponent for the exponential curve (default: 3). See below. |
+|      exp_pow      | Exponent for the exponential curve (default: 3, accepts decimals). See below. |
 
 For `speed_curve`, there's three options.
 |     Key     |                   Value                   |
@@ -31,7 +31,7 @@ For `speed_curve`, there's three options.
 | exponential |  Fan speed will be scaled exponentially.  |
 | logarithmic | Fan speed will be scaled logarithmically. |
 
-The `exp_pow` option controls the exponent used when `speed_curve` is set to `exponential`. A higher value makes the curve ramp up more aggressively at higher temperatures. The default is 3. `exp_pow=0` would make every temperature map to full speed, and `exp_pow=1` is equivalent to the linear curve. This option has no effect on `linear` or `logarithmic` curves.
+The `exp_pow` option controls the exponent used when `speed_curve` is set to `exponential`. It accepts decimal values (e.g. `exp_pow=2.5`). A higher value makes the curve ramp up more aggressively at higher temperatures. The default is 3. `exp_pow=1` is equivalent to the linear curve. This option has no effect on `linear` or `logarithmic` curves.
 
 Here's an image to better explain the speed curves. (Red: linear, blue: exponential, green: logarithmic)
 ![Image of fan curve graphs](https://user-images.githubusercontent.com/39993457/233580720-cfdaba12-a2d8-430c-87a2-15209dcfec6d.png)
