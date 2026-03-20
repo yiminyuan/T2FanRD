@@ -85,7 +85,8 @@ fn check_pid_file() -> Result<()> {
     std::fs::write(PID_FILE, current_pid).map_err(Error::PidWrite)
 }
 
-fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<std::fs::File> {
+fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
+    let temps = glob::glob("/sys/devices/platform/coretemp.0/hwmon/hwmon*/temp1_input")?;
     for temp_path_res in temps {
         let Ok(temp_path) = temp_path_res else {
             eprintln!("Unable to read glob path");
@@ -98,74 +99,11 @@ fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<std::fs::
         };
 
         if read_temp_file(&mut temp_file, temp_buf).is_ok() {
-            return Some(temp_file);
+            return Ok(temp_file);
         }
     }
 
-    None
-}
-
-fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
-    let temps = glob::glob("/sys/devices/platform/coretemp.0/hwmon/hwmon*/temp1_input")?;
-    find_temp_file(temps, temp_buf).ok_or(Error::NoCpu)
-}
-
-fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
-    // The Mac Pro 2019 (MacPro7,1) has no integrated GPU; its discrete GPUs
-    // are handled via the per-fan `sensors` config instead.
-    if let Ok(product_name) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
-        if product_name.trim() == "MacPro7,1" {
-            println!("MacPro7,1 detected, skipping integrated GPU temperature sensor");
-            return Ok(None);
-        }
-    }
-
-    let temps = glob::glob("/sys/class/drm/card0/device/hwmon/hwmon*/temp1_input")?;
-    Ok(find_temp_file(temps, temp_buf))
-}
-
-/// Construct an lm_sensors-compatible chip name from a hwmon driver name and
-/// the canonicalized device path.
-///
-/// For a PCI device at `/sys/devices/pci0000:00/.../0000:0b:00.0`, with driver
-/// name `amdgpu`, this returns `amdgpu-pci-0b00`.
-fn construct_chip_name(driver_name: &str, device_path: &std::path::Path) -> Option<String> {
-    let device_name = device_path.file_name()?.to_str()?;
-    // Parse PCI address: DDDD:BB:DD.F
-    let parts: Vec<&str> = device_name.split(':').collect();
-    if parts.len() == 3 {
-        let bus = parts[1]; // e.g. "0b"
-        let dev_func = parts[2]; // e.g. "00.0"
-        let dev = dev_func.split('.').next()?; // e.g. "00"
-        Some(format!("{driver_name}-pci-{bus}{dev}"))
-    } else {
-        None
-    }
-}
-
-/// Find the hwmon temp1_input file for a given lm_sensors-style sensor name
-/// (e.g. `amdgpu-pci-0b00`).
-fn find_hwmon_sensor(sensor_name: &str) -> Result<std::fs::File> {
-    let hwmon_paths = glob::glob("/sys/class/hwmon/hwmon*")?;
-    for hwmon_path in hwmon_paths.filter_map(std::result::Result::ok) {
-        let name_path = hwmon_path.join("name");
-        let Ok(name) = std::fs::read_to_string(&name_path) else {
-            continue;
-        };
-        let name = name.trim();
-
-        let device_path = hwmon_path.join("device");
-        if let Ok(real_path) = std::fs::canonicalize(&device_path) {
-            if let Some(chip_name) = construct_chip_name(name, &real_path) {
-                if chip_name == sensor_name {
-                    let temp_input = hwmon_path.join("temp1_input");
-                    return std::fs::File::open(temp_input).map_err(Error::TempRead);
-                }
-            }
-        }
-    }
-
-    Err(Error::SensorNotFound(sensor_name.to_owned()))
+    Err(Error::NoCpu)
 }
 
 /// Read all PCI addresses associated with a physical PCIe slot and its
@@ -249,16 +187,15 @@ fn find_slot_temp_files(slot: &str) -> Result<Vec<std::fs::File>> {
 /// Resolve a list of sensor specifiers to open file handles for their
 /// temp1_input files.
 ///
-/// Supported formats:
-/// - `slot:<N>` — all temperature sensors under physical PCIe slot N
-/// - `<chip-name>` — exact lm_sensors chip name (e.g. `amdgpu-pci-0b00`)
+/// Each specifier must be in `slot:<N>` format, referring to a physical PCIe
+/// slot number as exposed in `/sys/bus/pci/slots/`.
 fn find_sensor_temp_files(sensor_names: &[String]) -> Result<Vec<std::fs::File>> {
     let mut files = Vec::new();
     for name in sensor_names {
         if let Some(slot) = name.strip_prefix("slot:") {
             files.extend(find_slot_temp_files(slot)?);
         } else {
-            files.push(find_hwmon_sensor(name)?);
+            return Err(Error::InvalidConfigValue("sensors (expected slot:<N> format)"));
         }
     }
     Ok(files)
@@ -282,7 +219,6 @@ struct FanTempTracker {
 fn start_temp_loop(
     mut temp_buffer: String,
     mut cpu_temp_file: std::fs::File,
-    mut gpu_temp_file: Option<std::fs::File>,
     fans: &mut NonEmptyVec<FanController>,
 ) -> Result<()> {
     let cancellation_token = Arc::new(AtomicBool::new(false));
@@ -299,19 +235,13 @@ fn start_temp_loop(
 
     while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
         let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
-        let default_temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
-            let gpu_temp = read_temp_file(gpu_temp_file, &mut temp_buffer)?;
-            gpu_temp.max(cpu_temp)
-        } else {
-            cpu_temp
-        };
 
         let mut any_changed = false;
         for (fan, tracker) in fans.iter_mut().zip(trackers.iter_mut()) {
             let fan_temp = if let Some(sensor_temp) = fan.read_sensor_temp(&mut temp_buffer)? {
                 sensor_temp
             } else {
-                default_temp
+                cpu_temp
             };
 
             tracker.temps.push_back(fan_temp);
@@ -366,14 +296,13 @@ fn real_main() -> Result<()> {
     let mut fans = NonEmptyVec::from_vec(fans).ok_or(Error::NoFan)?;
 
     let cpu_temp_file = find_cpu_temp_file(&mut temp_buffer)?;
-    let gpu_temp_file = find_gpu_temp_file(&mut temp_buffer)?;
 
     println!();
     for fan in &fans {
         fan.set_manual(true)?;
     }
 
-    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_file, &mut fans);
+    let res = start_temp_loop(temp_buffer, cpu_temp_file, &mut fans);
     println!("T2 Fan Daemon is shutting down...");
     for fan in &fans {
         fan.set_manual(false)?;

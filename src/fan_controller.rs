@@ -76,7 +76,7 @@ impl FanController {
     }
 
     /// Read the maximum temperature across all custom sensors for this fan.
-    /// Returns `None` if no custom sensors are configured (use default CPU/GPU temp).
+    /// Returns `None` if no custom sensors are configured (use default CPU temp).
     pub fn read_sensor_temp(&mut self, temp_buf: &mut String) -> Result<Option<u8>> {
         if self.sensor_files.is_empty() {
             return Ok(None);
