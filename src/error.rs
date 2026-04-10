@@ -57,6 +57,13 @@ pub enum Error {
     #[error("Sensor {0} not found")]
     SensorNotFound(String),
 
+    #[error("NVML error")]
+    Nvml(
+        #[from]
+        #[source]
+        nvml_wrapper::error::NvmlError,
+    ),
+
     #[error("Cannot setup shutdown signals")]
     Signal(#[source] std::io::Error),
 

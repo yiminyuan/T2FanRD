@@ -17,7 +17,7 @@ use std::{
 };
 
 use arraydeque::ArrayDeque;
-use fan_controller::{read_temp_file, FanController};
+use fan_controller::{read_temp_file, FanController, TempSensor};
 use nonempty::NonEmpty as NonEmptyVec;
 use signal_hook::consts::{SIGINT, SIGTERM};
 
@@ -134,14 +134,25 @@ fn read_slot_addresses(slot: &str) -> Result<Vec<String>> {
     Ok(addresses)
 }
 
+/// Check whether a canonical sysfs path passes through any of the given PCI
+/// addresses. Slot addresses are `DDDD:BB:DD` (no function number), while
+/// sysfs path components are `DDDD:BB:DD.F` (with function number).
+fn is_downstream_of_slot(real_path_str: &str, addresses: &[String]) -> bool {
+    addresses.iter().any(|addr| {
+        real_path_str.split('/').any(|component| {
+            component.starts_with(addr.as_str())
+                && component
+                    .as_bytes()
+                    .get(addr.len())
+                    .map_or(true, |&b| b == b'.')
+        })
+    })
+}
+
 /// Find all hwmon temp1_input files for devices downstream of a physical PCIe
-/// slot. The slot number corresponds to entries in `/sys/bus/pci/slots/`.
-///
-/// This matches by checking whether the hwmon device's canonical sysfs path
-/// passes through any PCI address owned by the slot or its sub-slots.
-fn find_slot_temp_files(slot: &str) -> Result<Vec<std::fs::File>> {
-    let addresses = read_slot_addresses(slot)?;
-    let mut files = Vec::new();
+/// slot. Returns `TempSensor::Hwmon` entries.
+fn find_slot_hwmon_sensors(addresses: &[String]) -> Result<Vec<TempSensor>> {
+    let mut sensors = Vec::new();
 
     let hwmon_paths = glob::glob("/sys/class/hwmon/hwmon*")?;
     for hwmon_path in hwmon_paths.filter_map(std::result::Result::ok) {
@@ -155,50 +166,99 @@ fn find_slot_temp_files(slot: &str) -> Result<Vec<std::fs::File>> {
             continue;
         };
 
-        let real_path_str = real_path.to_string_lossy();
-
-        // Check if any path component matches a slot address.
-        // Slot addresses are "DDDD:BB:DD" (no function), sysfs path components
-        // are "DDDD:BB:DD.F" (with function), so we match the component prefix.
-        let is_downstream = addresses.iter().any(|addr| {
-            real_path_str.split('/').any(|component| {
-                component.starts_with(addr.as_str())
-                    && component
-                        .as_bytes()
-                        .get(addr.len())
-                        .map_or(true, |&b| b == b'.')
-            })
-        });
-
-        if is_downstream {
+        if is_downstream_of_slot(&real_path.to_string_lossy(), addresses) {
             if let Ok(file) = std::fs::File::open(&temp_input) {
-                files.push(file);
+                sensors.push(TempSensor::Hwmon(file));
             }
         }
     }
 
-    if files.is_empty() {
+    Ok(sensors)
+}
+
+/// Normalize an NVML PCI bus ID to standard sysfs format (4-digit domain).
+/// Some NVML versions report 8-digit domains (e.g. `00000000:01:00.0`);
+/// sysfs uses 4-digit domains (`0000:01:00.0`).
+fn normalize_nvml_bus_id(bus_id: &str) -> String {
+    if bus_id.len() > 4 && bus_id.as_bytes()[4] != b':' {
+        // Has 8-digit domain like "00000000:BB:DD.F"
+        if let Some(rest) = bus_id.get(4..) {
+            return rest.to_owned();
+        }
+    }
+    bus_id.to_owned()
+}
+
+/// Find NVIDIA GPUs that are downstream of the given slot addresses.
+/// Returns their PCI bus IDs as `TempSensor::Nvml` entries.
+fn find_slot_nvml_sensors(nvml: &nvml_wrapper::Nvml, addresses: &[String]) -> Vec<TempSensor> {
+    let device_count = match nvml.device_count() {
+        Ok(count) => count,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut sensors = Vec::new();
+
+    for i in 0..device_count {
+        let Ok(device) = nvml.device_by_index(i) else {
+            continue;
+        };
+        let Ok(pci_info) = device.pci_info() else {
+            continue;
+        };
+
+        let normalized = normalize_nvml_bus_id(&pci_info.bus_id);
+
+        // Canonicalize the sysfs PCI device path and check if it is
+        // downstream of any slot address.
+        let sysfs_device = format!("/sys/bus/pci/devices/{normalized}");
+        let Ok(real_path) = std::fs::canonicalize(&sysfs_device) else {
+            continue;
+        };
+
+        if is_downstream_of_slot(&real_path.to_string_lossy(), addresses) {
+            sensors.push(TempSensor::Nvml(normalized));
+        }
+    }
+
+    sensors
+}
+
+/// Find all temperature sensors (hwmon + NVIDIA) for devices downstream of a
+/// physical PCIe slot. The slot number corresponds to entries in
+/// `/sys/bus/pci/slots/`.
+fn find_slot_sensors(slot: &str, nvml: Option<&nvml_wrapper::Nvml>) -> Result<Vec<TempSensor>> {
+    let addresses = read_slot_addresses(slot)?;
+
+    let mut sensors = find_slot_hwmon_sensors(&addresses)?;
+    if let Some(nvml) = nvml {
+        sensors.extend(find_slot_nvml_sensors(nvml, &addresses));
+    }
+
+    if sensors.is_empty() {
         return Err(Error::SensorNotFound(format!("slot:{slot}")));
     }
 
-    Ok(files)
+    Ok(sensors)
 }
 
-/// Resolve a list of sensor specifiers to open file handles for their
-/// temp1_input files.
+/// Resolve a list of sensor specifiers to `TempSensor` entries.
 ///
 /// Each specifier must be in `slot:<N>` format, referring to a physical PCIe
 /// slot number as exposed in `/sys/bus/pci/slots/`.
-fn find_sensor_temp_files(sensor_names: &[String]) -> Result<Vec<std::fs::File>> {
-    let mut files = Vec::new();
+fn find_sensors(
+    sensor_names: &[String],
+    nvml: Option<&nvml_wrapper::Nvml>,
+) -> Result<Vec<TempSensor>> {
+    let mut sensors = Vec::new();
     for name in sensor_names {
         if let Some(slot) = name.strip_prefix("slot:") {
-            files.extend(find_slot_temp_files(slot)?);
+            sensors.extend(find_slot_sensors(slot, nvml)?);
         } else {
             return Err(Error::InvalidConfigValue("sensors (expected slot:<N> format)"));
         }
     }
-    Ok(files)
+    Ok(sensors)
 }
 
 fn main() -> ExitCode {
@@ -220,6 +280,7 @@ fn start_temp_loop(
     mut temp_buffer: String,
     mut cpu_temp_file: std::fs::File,
     fans: &mut NonEmptyVec<FanController>,
+    nvml: Option<&nvml_wrapper::Nvml>,
 ) -> Result<()> {
     let cancellation_token = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, cancellation_token.clone()).map_err(Error::Signal)?;
@@ -238,11 +299,12 @@ fn start_temp_loop(
 
         let mut any_changed = false;
         for (fan, tracker) in fans.iter_mut().zip(trackers.iter_mut()) {
-            let fan_temp = if let Some(sensor_temp) = fan.read_sensor_temp(&mut temp_buffer)? {
-                sensor_temp
-            } else {
-                cpu_temp
-            };
+            let fan_temp =
+                if let Some(sensor_temp) = fan.read_sensor_temp(&mut temp_buffer, nvml)? {
+                    sensor_temp
+                } else {
+                    cpu_temp
+                };
 
             tracker.temps.push_back(fan_temp);
 
@@ -278,6 +340,13 @@ fn real_main() -> Result<()> {
 
     check_pid_file()?;
 
+    // Initialize NVML for NVIDIA GPU support. If the NVIDIA driver is not
+    // installed, this will fail and we silently skip NVIDIA detection.
+    let nvml = nvml_wrapper::Nvml::init().ok();
+    if nvml.is_some() {
+        println!("NVML initialized, NVIDIA GPU support enabled");
+    }
+
     let mut temp_buffer = String::new();
 
     let fan_paths = find_fan_paths()?;
@@ -288,8 +357,8 @@ fn real_main() -> Result<()> {
         .into_iter()
         .zip(configs)
         .map(|(path, config)| {
-            let sensor_files = find_sensor_temp_files(&config.sensors)?;
-            FanController::new(path, config, sensor_files)
+            let sensors = find_sensors(&config.sensors, nvml.as_ref())?;
+            FanController::new(path, config, sensors)
         })
         .collect::<Result<_>>()?;
 
@@ -302,7 +371,7 @@ fn real_main() -> Result<()> {
         fan.set_manual(true)?;
     }
 
-    let res = start_temp_loop(temp_buffer, cpu_temp_file, &mut fans);
+    let res = start_temp_loop(temp_buffer, cpu_temp_file, &mut fans, nvml.as_ref());
     println!("T2 Fan Daemon is shutting down...");
     for fan in &fans {
         fan.set_manual(false)?;
