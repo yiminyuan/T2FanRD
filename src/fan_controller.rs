@@ -3,10 +3,23 @@ use std::{
     path::PathBuf,
 };
 
+use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
+
 use crate::{
     config::{FanConfig, SpeedCurve},
     error::{Error, Result},
 };
+
+/// A temperature sensor source. Either a hwmon sysfs file (AMD, CPU, etc.)
+/// or an NVIDIA GPU queried via NVML.
+#[derive(Debug)]
+pub enum TempSensor {
+    /// A hwmon `temp*_input` file that reports millidegrees Celsius.
+    Hwmon(std::fs::File),
+    /// An NVIDIA GPU identified by its PCI bus ID (e.g. `0000:01:00.0`).
+    /// Temperature is read via NVML.
+    Nvml(String),
+}
 
 pub(crate) fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut String) -> Result<u8> {
     temp_file
@@ -20,6 +33,16 @@ pub(crate) fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut Strin
     temp.map(|t| (t / 1000) as u8)
 }
 
+/// Read the temperature of an NVIDIA GPU via NVML.
+/// The `bus_id` should be in normalized PCI format (e.g. `0000:01:00.0`).
+fn read_nvml_temp(nvml: &Nvml, bus_id: &str) -> Result<u8> {
+    // device_by_pci_bus_id requires S where Vec<u8>: From<S>, which is
+    // satisfied by String but not &str, so we need an owned copy.
+    let device = nvml.device_by_pci_bus_id(bus_id.to_owned())?;
+    let temp = device.temperature(TemperatureSensor::Gpu)?;
+    Ok(temp as u8)
+}
+
 #[derive(Debug)]
 pub struct FanController {
     manual_file: std::fs::File,
@@ -28,11 +51,11 @@ pub struct FanController {
 
     min_speed: u32,
     max_speed: u32,
-    sensor_files: Vec<std::fs::File>,
+    sensors: Vec<TempSensor>,
 }
 
 impl FanController {
-    pub fn new(path: PathBuf, config: FanConfig, sensor_files: Vec<std::fs::File>) -> Result<Self> {
+    pub fn new(path: PathBuf, config: FanConfig, sensors: Vec<TempSensor>) -> Result<Self> {
         fn join_suffix(mut path: PathBuf, suffix: &str) -> PathBuf {
             let file_name = path.file_name().unwrap().to_str().unwrap();
             path.set_file_name(format!("{file_name}{suffix}"));
@@ -68,7 +91,7 @@ impl FanController {
             config,
             min_speed,
             max_speed,
-            sensor_files,
+            sensors,
         };
 
         println!("Found fan: {this:#?}");
@@ -77,14 +100,24 @@ impl FanController {
 
     /// Read the maximum temperature across all custom sensors for this fan.
     /// Returns `None` if no custom sensors are configured (use default CPU temp).
-    pub fn read_sensor_temp(&mut self, temp_buf: &mut String) -> Result<Option<u8>> {
-        if self.sensor_files.is_empty() {
+    pub fn read_sensor_temp(
+        &mut self,
+        temp_buf: &mut String,
+        nvml: Option<&Nvml>,
+    ) -> Result<Option<u8>> {
+        if self.sensors.is_empty() {
             return Ok(None);
         }
 
         let mut max_temp = 0u8;
-        for sensor_file in &mut self.sensor_files {
-            let temp = read_temp_file(sensor_file, temp_buf)?;
+        for sensor in &mut self.sensors {
+            let temp = match sensor {
+                TempSensor::Hwmon(file) => read_temp_file(file, temp_buf)?,
+                TempSensor::Nvml(bus_id) => {
+                    let nvml = nvml.expect("NVML sensor present but NVML not initialized");
+                    read_nvml_temp(nvml, bus_id)?
+                }
+            };
             max_temp = max_temp.max(temp);
         }
         Ok(Some(max_temp))

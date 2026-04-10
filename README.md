@@ -41,6 +41,8 @@ By default, fan speed is based on CPU temperature. The `sensors` key lets you as
 
 Use the `slot:<N>` format, where `<N>` is a physical PCIe slot number as exposed in `/sys/bus/pci/slots/`. This is stable across PCIe topology changes — adding or removing a PCIe card won't shift PCI bus addresses and break your config.
 
+Both AMD (hwmon) and NVIDIA GPUs are supported transparently. For AMD GPUs, temperatures are read from `/sys/class/hwmon/`. For NVIDIA GPUs, temperatures are queried via the NVIDIA Management Library (NVML). If the NVIDIA driver is not installed, NVIDIA detection is silently skipped.
+
 You can find physical slot numbers with:
 ```
 ls /sys/bus/pci/slots/
