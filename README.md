@@ -6,13 +6,22 @@ Fan Daemon for the Mac Pro 2019 (MacPro7,1), based on the [original version](htt
 `cargo build --release`
 
 ## Installation
-1. Copy the `target/release/t2fanrd` executable to wherever your distro wants executables to be run by root.
-2. Setup the executable to be run automatically at startup, like via a [systemd service](https://github.com/t2linux/fedora/blob/2947fdc909a35f04eb936a4f9c0f33fe4e52d9c2/t2fanrd/t2fanrd.service).
+1. Install the `target/release/t2fanrd` executable to `/usr/bin/t2fanrd` (the path the bundled systemd unit expects):
+   ```
+   sudo install -m 0755 target/release/t2fanrd /usr/bin/t2fanrd
+   ```
+2. Install the systemd unit from `systemd/t2fanrd.service` to `/etc/systemd/system/t2fanrd.service`, then enable and start it:
+   ```
+   sudo install -m 0644 systemd/t2fanrd.service /etc/systemd/system/t2fanrd.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now t2fanrd.service
+   ```
+   The unit runs `t2fanrd` as root with `Restart=always` and writes its PID to `/run/t2fand.pid`.
 
 ## Configuration
 Initial configuration will be done automatically on first run.
 
-For manual config, the config file can be found at `/etc/t2fand.conf`.
+For manual config, the config file can be found at `/etc/t2fand.conf`. A reference config for a Mac Pro 2019 with two MPX modules is included at `systemd/t2fand.conf` — copy it to `/etc/t2fand.conf` to skip the auto-generated defaults.
 
 There's six options for each fan.
 |        Key        |                            Value                            |
@@ -61,8 +70,8 @@ always_full_speed=false
 
 # Front intake fan - bottom
 [Fan2]
-low_temp=55
-high_temp=80
+low_temp=50
+high_temp=85
 speed_curve=exponential
 always_full_speed=false
 sensors=slot:1
@@ -70,8 +79,8 @@ exp_pow=2.5
 
 # Front intake fan - middle
 [Fan3]
-low_temp=55
-high_temp=80
+low_temp=50
+high_temp=85
 speed_curve=exponential
 always_full_speed=false
 sensors=slot:3

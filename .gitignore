@@ -1,7 +1,1 @@
 target
-*.conf
-*.pid
-*.py
-.vscode
-/result
-.DS_Store
