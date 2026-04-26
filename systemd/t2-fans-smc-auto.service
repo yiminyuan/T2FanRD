@@ -1,0 +1,16 @@
+[Unit]
+Description=Restore T2 fan controller to SMC auto mode
+# Workaround for the HW_POWER_BRAKE bug: putting >=2 T2 fans into manual
+# mode causes the SMC to assert HW_POWER_BRAKE on the NVIDIA add-in GPU,
+# capping graphics power at ~50% TDP. Keep all fans on SMC auto curves.
+# See T2_POWER_BRAKE_REPORT.md in the repo root for details.
+Conflicts=t2fanrd.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for f in /sys/devices/pci*/*/*/*/APP0001:00/fan*_manual; do echo 0 > "$f"; done'
+
+[Install]
+WantedBy=multi-user.target
