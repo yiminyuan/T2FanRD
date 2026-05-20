@@ -1,0 +1,13 @@
+[Unit]
+Description=A simple daemon to control fan speed on Mac Pro 2019
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+ExecStart=/usr/bin/t2fanrd
+ExecReload=/bin/kill -HUP $MAINPID
+PIDFile=/run/t2fand.pid
+
+[Install]
+WantedBy=default.target
