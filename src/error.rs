@@ -9,9 +9,9 @@ pub enum Error {
 
     #[error("Temperature sensor cannot be read")]
     TempRead(#[source] std::io::Error),
-    #[error("Temperature sensor cannot be seeked")]
-    TempSeek(#[source] std::io::Error),
-    #[error("Temporature sensor cannot be parsed")]
+    #[error("Temperature sensor returned non-UTF-8 data")]
+    TempUtf8,
+    #[error("Temperature sensor cannot be parsed")]
     TempParse(#[source] std::num::ParseIntError),
 
     #[error("Cannot read minimum fan speed")]
@@ -53,6 +53,15 @@ pub enum Error {
     FanOpen(#[source] std::io::Error),
     #[error("Cannot write to fan controller")]
     FanWrite(#[source] std::io::Error),
+
+    #[error("Sensor {0} not found")]
+    SensorNotFound(String),
+
+    #[error("All fans are configured with auto=true; t2fanrd has nothing to control")]
+    AllFansAuto,
+
+    #[error("Config structure changed ({0}); restart t2fanrd to apply")]
+    ConfigStructureChanged(String),
 
     #[error("Cannot setup shutdown signals")]
     Signal(#[source] std::io::Error),

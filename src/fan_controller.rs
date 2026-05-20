@@ -1,5 +1,6 @@
 use std::{
     io::{IsTerminal, Write},
+    os::unix::fs::FileExt,
     path::PathBuf,
 };
 
@@ -7,6 +8,49 @@ use crate::{
     config::{FanConfig, SpeedCurve},
     error::{Error, Result},
 };
+
+pub(crate) fn read_temp_file(temp_file: &std::fs::File) -> Result<u8> {
+    let mut buf = [0u8; 16];
+    let n = temp_file.read_at(&mut buf, 0).map_err(Error::TempRead)?;
+    let s = std::str::from_utf8(&buf[..n]).map_err(|_| Error::TempUtf8)?;
+    let temp = s.trim_end().parse::<u32>().map_err(Error::TempParse)?;
+    Ok((temp / 1000) as u8)
+}
+
+#[derive(Debug)]
+pub enum SensorIdx {
+    Cpu,
+    Hwmon(usize),
+}
+
+/// Daemon-level pool of unique sensor file handles. Each unique CPU /
+/// hwmon `temp1_input` is opened once and read once per tick, regardless of
+/// how many fans reference it.
+#[derive(Debug)]
+pub struct SensorPool {
+    pub cpu_file: Option<std::fs::File>,
+    pub hwmons: Vec<std::fs::File>,
+}
+
+#[derive(Debug)]
+pub struct SensorReadings {
+    pub cpu: Option<u8>,
+    pub hwmons: Vec<u8>,
+}
+
+impl SensorPool {
+    pub fn read_all(&self) -> Result<SensorReadings> {
+        let cpu = match &self.cpu_file {
+            Some(f) => Some(read_temp_file(f)?),
+            None => None,
+        };
+        let mut hwmons = Vec::with_capacity(self.hwmons.len());
+        for f in &self.hwmons {
+            hwmons.push(read_temp_file(f)?);
+        }
+        Ok(SensorReadings { cpu, hwmons })
+    }
+}
 
 #[derive(Debug)]
 pub struct FanController {
@@ -16,10 +60,11 @@ pub struct FanController {
 
     min_speed: u32,
     max_speed: u32,
+    sensors: Vec<SensorIdx>,
 }
 
 impl FanController {
-    pub fn new(path: PathBuf, config: FanConfig) -> Result<Self> {
+    pub fn new(path: PathBuf, config: FanConfig, sensors: Vec<SensorIdx>) -> Result<Self> {
         fn join_suffix(mut path: PathBuf, suffix: &str) -> PathBuf {
             let file_name = path.file_name().unwrap().to_str().unwrap();
             path.set_file_name(format!("{file_name}{suffix}"));
@@ -55,10 +100,43 @@ impl FanController {
             config,
             min_speed,
             max_speed,
+            sensors,
         };
 
         println!("Found fan: {this:#?}");
         Ok(this)
+    }
+
+    pub fn min_speed(&self) -> u32 {
+        self.min_speed
+    }
+
+    pub fn max_speed(&self) -> u32 {
+        self.max_speed
+    }
+
+    pub fn config(&self) -> &FanConfig {
+        &self.config
+    }
+
+    pub fn set_config(&mut self, config: FanConfig) {
+        self.config = config;
+    }
+
+    /// Returns the max temp across this fan's sensors, looked up from the
+    /// per-tick `SensorReadings` produced by `SensorPool::read_all`.
+    pub fn compute_max_temp(&self, readings: &SensorReadings) -> u8 {
+        let mut max_temp = 0u8;
+        for sensor in &self.sensors {
+            let temp = match sensor {
+                SensorIdx::Cpu => readings
+                    .cpu
+                    .expect("CPU sensor configured but CPU temp not read"),
+                SensorIdx::Hwmon(i) => readings.hwmons[*i],
+            };
+            max_temp = max_temp.max(temp);
+        }
+        max_temp
     }
 
     pub fn set_manual(&self, enabled: bool) -> Result<()> {
@@ -108,7 +186,9 @@ impl FanController {
                     + self.min_speed
             }
             SpeedCurve::Exponential => {
-                ((temp - low_temp).pow(3) as f32 / (high_temp - low_temp).pow(3) as f32
+                let exp = self.config.exp_pow;
+                (((temp - low_temp) as f32).powf(exp)
+                    / ((high_temp - low_temp) as f32).powf(exp)
                     * (self.max_speed - self.min_speed) as f32) as u32
                     + self.min_speed
             }

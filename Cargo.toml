@@ -3,8 +3,8 @@ name = "t2fanrd"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "Simple Fan Daemon for T2 Macs"
-repository = "https://github.com/GnomedDev/T2FanRD"
+description = "Fan Daemon for the Mac Pro 2019 (MacPro7,1)"
+repository = "https://github.com/yiminyuan/T2FanRD"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,7 +15,6 @@ nonempty = { version = "0.10.0", default-features = false }
 rust-ini = { version = "0.21.0", default-features = false }
 thiserror = { version = "1.0.50", default-features = false }
 signal-hook = { version = "0.3.17", default-features = false }
-arraydeque = "0.5.1"
 
 [profile.release]
 lto = "thin"

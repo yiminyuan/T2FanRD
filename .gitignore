@@ -1,6 +1,2 @@
 target
-*.conf
-*.pid
-*.py
-.vscode
-/result
+CLAUDE.md
