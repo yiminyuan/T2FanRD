@@ -1,6 +1,6 @@
 use std::{
     io::{IsTerminal, Write},
-    os::unix::fs::FileExt,
+    os::unix::fs::{FileExt, PermissionsExt},
     path::PathBuf,
 };
 
@@ -54,8 +54,7 @@ impl SensorPool {
 
 #[derive(Debug)]
 pub struct FanController {
-    manual_file: std::fs::File,
-    output_file: std::fs::File,
+    target_file: std::fs::File,
     config: FanConfig,
 
     min_speed: u32,
@@ -83,20 +82,30 @@ impl FanController {
             .parse()
             .map_err(Error::MaxSpeedParse)?;
 
-        let mut open_options = std::fs::OpenOptions::new();
-        open_options.write(true).truncate(true);
+        let target_path = join_suffix(path, "_target");
 
-        let manual_file = open_options
-            .open(join_suffix(path.clone(), "_manual"))
-            .map_err(Error::FanOpen)?;
+        // macsmc creates fanN_target read-only unless the module was loaded
+        // with fan_control=1; the mode is fixed at probe time, so a read-only
+        // node means this fan cannot be driven. Fail loudly instead of
+        // silently writing to a file the kernel will reject.
+        let writable = std::fs::metadata(&target_path)
+            .map_err(Error::FanOpen)?
+            .permissions()
+            .mode()
+            & 0o200
+            != 0;
+        if !writable {
+            return Err(Error::FanControlDisabled);
+        }
 
-        let output_file = open_options
-            .open(join_suffix(path, "_output"))
+        let target_file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target_path)
             .map_err(Error::FanOpen)?;
 
         let this = Self {
-            manual_file,
-            output_file,
+            target_file,
             config,
             min_speed,
             max_speed,
@@ -139,12 +148,16 @@ impl FanController {
         max_temp
     }
 
-    pub fn set_manual(&self, enabled: bool) -> Result<()> {
-        (&self.manual_file)
-            .write_all(if enabled { b"1" } else { b"0" })
-            .map_err(Error::FanWrite)
+    /// Hand this fan back to the SMC's own curve. Writing `0` to `fanN_target`
+    /// makes macsmc clear the per-fan manual mode key (`F{i}Md` = 0).
+    pub fn release_to_auto(&self) -> Result<()> {
+        (&self.target_file).write_all(b"0").map_err(Error::FanWrite)
     }
 
+    /// Drive this fan at `speed` RPM. Writing a value in [min, max] to
+    /// `fanN_target` makes macsmc engage manual mode (`F{i}Md` = 1) and set the
+    /// target; the daemon never writes 0 here, so it cannot accidentally
+    /// release to auto.
     pub fn set_speed(&self, mut speed: u32) -> Result<()> {
         if speed < self.min_speed {
             speed = self.min_speed;
@@ -160,7 +173,7 @@ impl FanController {
             }
         }
 
-        write!(&self.output_file, "{speed}").map_err(Error::FanWrite)?;
+        write!(&self.target_file, "{speed}").map_err(Error::FanWrite)?;
         Ok(())
     }
 

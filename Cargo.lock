@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "t2fanrd"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "glob",
  "libc",

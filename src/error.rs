@@ -54,6 +54,13 @@ pub enum Error {
     #[error("Cannot write to fan controller")]
     FanWrite(#[source] std::io::Error),
 
+    #[error(
+        "macsmc fan control is disabled (fanN_target is read-only). Add \
+         'options macsmc_hwmon fan_control=1' to /etc/modprobe.d and reload \
+         the module (or reboot)"
+    )]
+    FanControlDisabled,
+
     #[error("Sensor {0} not found")]
     SensorNotFound(String),
 
