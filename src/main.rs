@@ -50,29 +50,48 @@ fn get_current_euid() -> libc::uid_t {
     unsafe { libc::geteuid() }
 }
 
-fn find_fan_paths() -> Result<NonEmptyVec<PathBuf>> {
-    // APP0001:00/fan1_label
-    let fan = glob::glob("/sys/devices/pci*/*/*/*/APP0001:00/fan*")?
-        .filter_map(Result::ok)
-        .find(|p| p.exists())
-        .ok_or(Error::NoFan)?;
+/// Locate the `macsmc_hwmon` hwmon directory (the T2 SMC fan controller on
+/// kernel 7.1+). The hwmon index is not stable across boots, so match by the
+/// `name` attribute rather than a fixed path.
+fn find_macsmc_hwmon() -> Result<PathBuf> {
+    for name_path in glob::glob("/sys/class/hwmon/hwmon*/name")?.filter_map(Result::ok) {
+        if let Ok(name) = std::fs::read_to_string(&name_path) {
+            if name.trim() == "macsmc_hwmon" {
+                return name_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or(Error::NoFan);
+            }
+        }
+    }
+    Err(Error::NoFan)
+}
 
-    // APP0001:00
-    let first_fan_path = fan.parent().ok_or(Error::NoFan)?;
-    // APP0001:00/fan*_input
-    let fan_glob = first_fan_path.display().to_string() + "/fan*_input";
-    // APP0001:00/fan1
-    let fans = glob::glob(&fan_glob)?
+/// Discover fan control stems under the macsmc hwmon, e.g.
+/// `/sys/class/hwmon/hwmonN/fan1`. Each stem suffixes to `_min` / `_max` /
+/// `_target` / `_input`. Returned in ascending fan index so the order lines
+/// up with the `[Fan1]`, `[Fan2]`, … config sections.
+fn find_fan_paths() -> Result<NonEmptyVec<PathBuf>> {
+    let hwmon_dir = find_macsmc_hwmon()?;
+    let fan_glob = hwmon_dir.join("fan*_input");
+    let fan_glob = fan_glob.to_str().ok_or(Error::NoFan)?;
+
+    let mut fans: Vec<(u32, PathBuf)> = glob::glob(fan_glob)?
         .filter_map(Result::ok)
         .filter_map(|mut path| {
             let file_name = path.file_name()?.to_str()?;
-            let fan_name = file_name.strip_suffix("_input")?;
-            let fan_name_owned = fan_name.to_owned();
-            path.set_file_name(fan_name_owned);
-            Some(path)
-        });
+            let stem = file_name.strip_suffix("_input")?;
+            let index: u32 = stem.strip_prefix("fan")?.parse().ok()?;
+            let stem = stem.to_owned();
+            path.set_file_name(stem);
+            Some((index, path))
+        })
+        .collect();
 
-    NonEmptyVec::collect(fans).ok_or(Error::NoFan)
+    fans.sort_by_key(|(index, _)| *index);
+    let fan_paths: Vec<PathBuf> = fans.into_iter().map(|(_, path)| path).collect();
+
+    NonEmptyVec::from_vec(fan_paths).ok_or(Error::NoFan)
 }
 
 fn check_pid_file() -> Result<()> {
@@ -400,8 +419,8 @@ fn release_fan_to_smc(fan_path: &Path) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or(Error::NoFan)?;
-    let manual_path = fan_path.with_file_name(format!("{file_name}_manual"));
-    std::fs::write(&manual_path, b"0").map_err(Error::FanWrite)
+    let target_path = fan_path.with_file_name(format!("{file_name}_target"));
+    std::fs::write(&target_path, b"0").map_err(Error::FanWrite)
 }
 
 fn main() -> ExitCode {
@@ -565,9 +584,13 @@ fn real_main() -> Result<()> {
     }
 
     // Force any auto=true fan back to SMC mode in case a previous daemon run
-    // left it in manual mode. Daemon then ignores these fans.
+    // left it in manual. Best-effort: if fan_control is off the fan is
+    // already on the SMC curve (manual was never possible), so a failed
+    // write here is benign. Daemon then ignores these fans.
     for path in &auto_paths {
-        release_fan_to_smc(path)?;
+        if let Err(e) = release_fan_to_smc(path) {
+            eprintln!("Failed to release auto fan to SMC: {e}");
+        }
     }
 
     if tracked.is_empty() {
@@ -609,20 +632,20 @@ fn real_main() -> Result<()> {
     let mut fans = NonEmptyVec::from_vec(fans).ok_or(Error::NoFan)?;
 
     println!();
-    for fan in &fans {
-        fan.set_manual(true)?;
-    }
+    // No explicit manual-engage: macsmc switches a fan to manual on the first
+    // fanN_target write, and the loop's first tick always writes (last_pwm
+    // starts at 0), so the fan is taken over on tick 1.
 
     let res = start_temp_loop(&mut sensor_pool, &mut fans, &auto_pattern, fan_count);
 
-    // Release every fan to SMC auto on exit (stop, restart, reboot, shutdown).
-    // The SMC firmware does not restore a perfectly clean auto curve after a
-    // fan has been under manual control regardless of when we release, so
-    // there is no benefit to deferring it; the service's ExecStopPost repeats
-    // this as a best-effort net in case the daemon is SIGKILLed first.
+    // Release every tracked fan to SMC auto on exit (stop, restart, reboot,
+    // shutdown). This is the maximal handoff the SMC allows; it does not fully
+    // reset the SMC's auto curve (see README / CLAUDE.md), but it is the right
+    // thing on every exit path. The service's ExecStopPost repeats this as a
+    // best-effort net in case the daemon is SIGKILLed before reaching here.
     println!("T2 Fan Daemon is shutting down, releasing fans to SMC auto...");
     for fan in &fans {
-        if let Err(e) = fan.set_manual(false) {
+        if let Err(e) = fan.release_to_auto() {
             eprintln!("Failed to release fan to SMC auto: {e}");
         }
     }

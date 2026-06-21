@@ -32,7 +32,7 @@ Each tick of `start_temp_loop` in `src/main.rs` runs every tracked fan's reading
                                                                                   write to sysfs?
 ```
 
-Stages 1–5 are pure functions of state + input. Only stage 5 decides whether to actually `write()` to the fan's `_output` file.
+Stages 1–5 are pure functions of state + input. Only stage 5 decides whether to actually `write()` to the fan's `fanN_target` file (the macsmc RPM setpoint; the daemon writes an RPM in `[min, max]`, which makes macsmc engage manual mode for that fan). "PWM" below is used loosely for that setpoint value.
 
 ## Stage 1 — Sensor pool read
 

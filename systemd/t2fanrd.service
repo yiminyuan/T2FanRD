@@ -9,8 +9,8 @@ ExecStart=/usr/bin/t2fanrd
 ExecReload=/bin/kill -HUP $MAINPID
 # Safety net: the daemon releases fans to SMC auto on a clean exit, but if it
 # is SIGKILLed (e.g. stop timeout, OOM) or panics it cannot. Write 0 to every
-# fan's _manual node so fans never stay pinned in manual. Best-effort ('-').
-ExecStopPost=-/bin/sh -c 'for f in /sys/devices/pci*/*/*/*/APP0001:00/fan*_manual; do [ -e "$$f" ] && echo 0 > "$$f" 2>/dev/null; done'
+# macsmc fanN_target so fans never stay pinned in manual. Best-effort ('-').
+ExecStopPost=-/bin/sh -c 'for t in /sys/class/hwmon/hwmon*/fan*_target; do [ -e "$$t" ] && echo 0 > "$$t" 2>/dev/null; done'
 PIDFile=/run/t2fand.pid
 
 [Install]

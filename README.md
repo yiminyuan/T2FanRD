@@ -2,6 +2,15 @@
 
 Fan Daemon for the Mac Pro 2019 (MacPro7,1), based on the [original version](https://github.com/GnomedDev/T2FanRD).
 
+## Requirements
+
+Linux **kernel 7.1 or newer**, where the T2 SMC is driven by the `macsmc`
+stack (`macsmc_hwmon`). The old `applesmc` driver must be blacklisted (it
+can't reach a T2 SMC and slows boot); a drop-in is provided in step 2. The
+daemon controls fans through `macsmc_hwmon`'s `fanN_target` nodes, which the
+kernel exposes **read-only unless** the module is loaded with `fan_control=1`
+(see step 2).
+
 ## Compilation
 `cargo build --release`
 
@@ -10,13 +19,28 @@ Fan Daemon for the Mac Pro 2019 (MacPro7,1), based on the [original version](htt
    ```
    sudo install -m 0755 target/release/t2fanrd /usr/bin/t2fanrd
    ```
-2. Install the systemd unit from `systemd/t2fanrd.service` to `/etc/systemd/system/t2fanrd.service`, then enable and start it:
+2. Blacklist `applesmc`, and enable manual fan control in `macsmc_hwmon` by installing the modprobe drop-ins, then reload the module so `fan_control` takes effect (a reboot also works):
+   ```
+   sudo install -m 0644 systemd/applesmc-blacklist.conf /etc/modprobe.d/applesmc-blacklist.conf
+   sudo install -m 0644 systemd/macsmc_hwmon.conf /etc/modprobe.d/macsmc_hwmon.conf
+   sudo modprobe -r macsmc_hwmon; sudo modprobe macsmc_hwmon
+   ```
+   Confirm it took effect — `fanN_target` should now be writable (`0644`):
+   ```
+   ls -l /sys/class/hwmon/hwmon*/fan1_target
+   ```
+   Without this, the daemon exits at startup with a "fan control is disabled" error.
+3. Install the systemd unit from `systemd/t2fanrd.service` to `/etc/systemd/system/t2fanrd.service`, then enable and start it:
    ```
    sudo install -m 0644 systemd/t2fanrd.service /etc/systemd/system/t2fanrd.service
    sudo systemctl daemon-reload
    sudo systemctl enable --now t2fanrd.service
    ```
    The unit runs `t2fanrd` as root with `Restart=always` and writes its PID to `/run/t2fand.pid`. On any exit — stop, restart, reboot, shutdown — the daemon hands the fans back to SMC auto; an `ExecStopPost` repeats this as a best-effort net in case the daemon is killed before it can.
+
+## A note on fan handoff back to the SMC
+
+When the daemon exits it releases each controlled fan to SMC auto (writes `0` to `fanN_target`). On this hardware the SMC firmware does **not** fully restore a clean auto curve after a fan has been under manual control — a released fan tends to come back elevated (the CPU fan especially can run high) until either the daemon takes over again or macOS performs a full SMC init. This is an SMC firmware limitation with no Linux-side fix (the driver exposes only manual-on/off and target; there is no reset primitive). If this bothers you, set `auto=true` for the affected fan so the daemon never puts it into manual — that fan then stays under the SMC's own clean auto control.
 
 ## Configuration
 Initial configuration will be done automatically on first run.
