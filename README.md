@@ -59,7 +59,7 @@ Here's an image to better explain the speed curves. (Red: linear, blue: exponent
 The `sensors` key declares which temperature sensors drive the fan. The fan responds to the highest temperature across every entry in the list. The supported entry formats are:
 
 - `cpu` — read from `/sys/devices/platform/coretemp.0/hwmon/hwmon*/temp1_input`.
-- `slot:<N>` — read every **GPU** in physical slot `<N>` (as listed in `/sys/bus/pci/slots/`). AMD and other GPUs are read from their hwmon `temp1_input`; **NVIDIA** GPUs — which expose no hwmon temperature — are read via **NVML**. Only display controllers (PCI class `0x03`) are matched, so incidental devices in the slot's sub-tree (ethernet, audio, NVMe) are ignored. Multi-die GPUs (e.g. the W6800X Duo) expose one sensor per die; all of them are included automatically.
+- `slot:<N>` — read every **GPU** in physical slot `<N>` (as listed in `/sys/bus/pci/slots/`). AMD and other GPUs are read from their hwmon junction/hotspot temp (`temp2_input`, falling back to edge `temp1_input`) — junction is what the GPU throttles on; **NVIDIA** GPUs — which expose no hwmon temperature — are read via **NVML**. Only display controllers (PCI class `0x03`) are matched, so incidental devices in the slot's sub-tree (ethernet, audio, NVMe) are ignored. Multi-die GPUs (e.g. the W6800X Duo) expose one sensor per die; all of them are included automatically.
 
 The two formats can be combined, e.g. `sensors=cpu,slot:1` for a fan that should respond to whichever is hotter between CPU and slot 1. A single slot may even mix sources — `sensors=slot:3,slot:5` where slot 3 holds an AMD module and slot 5 an NVIDIA card resolves to the max of all of them.
 
@@ -85,8 +85,8 @@ auto=true
 # Front intake fan - bottom
 [Fan2]
 auto=false
-low_temp=50
-high_temp=85
+low_temp=60
+high_temp=100
 speed_curve=exponential
 always_full_speed=false
 sensors=slot:1
@@ -95,8 +95,8 @@ exp_pow=3.0
 # Front intake fan - middle (slot 3 AMD module + slot 5 NVIDIA GPU)
 [Fan3]
 auto=false
-low_temp=50
-high_temp=85
+low_temp=60
+high_temp=100
 speed_curve=exponential
 always_full_speed=false
 sensors=slot:3,slot:5

@@ -193,13 +193,20 @@ fn slot_for_path<'a>(
 }
 
 /// Scan every GPU hwmon (AMD etc.) and attribute it to its owning slot. Returns
-/// slot -> hwmon `temp1_input` paths.
+/// slot -> hwmon temp paths (junction/hotspot where exposed, else edge).
 fn resolve_slot_attribution(
     slot_addresses: &HashMap<String, Vec<String>>,
 ) -> Result<HashMap<String, Vec<PathBuf>>> {
     let mut slot_hwmons: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for hwmon_path in glob::glob("/sys/class/hwmon/hwmon*")?.filter_map(std::result::Result::ok) {
-        let temp_input = hwmon_path.join("temp1_input");
+        // Prefer junction/hotspot (temp2) over edge (temp1) — junction is what
+        // the GPU throttles on. Fall back to edge if the card lacks it.
+        let junction = hwmon_path.join("temp2_input");
+        let temp_input = if junction.exists() {
+            junction
+        } else {
+            hwmon_path.join("temp1_input")
+        };
         if !temp_input.exists() {
             continue;
         }
