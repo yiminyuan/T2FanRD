@@ -49,15 +49,6 @@ fn get_current_euid() -> libc::uid_t {
     unsafe { libc::geteuid() }
 }
 
-fn is_system_stopping() -> bool {
-    std::process::Command::new("systemctl")
-        .arg("is-system-running")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .is_some_and(|s| s.trim() == "stopping")
-}
-
 fn find_fan_paths() -> Result<NonEmptyVec<PathBuf>> {
     // APP0001:00/fan1_label
     let fan = glob::glob("/sys/devices/pci*/*/*/*/APP0001:00/fan*")?
@@ -492,18 +483,15 @@ fn real_main() -> Result<()> {
 
     let res = start_temp_loop(&sensor_pool, &mut fans, &auto_pattern, fan_count);
 
-    if is_system_stopping() {
-        // Leave fans in their current state (manual=1, last commanded Tg) so
-        // the SMC keeps obeying us through the busy shutdown phase. The
-        // system-shutdown hook flips manual=0 at the very end, in a quiet
-        // moment, just before kernel halt.
-        println!("System shutdown detected, leaving fans for the shutdown hook to release...");
-    } else {
-        println!("T2 Fan Daemon is shutting down, releasing fans to SMC auto...");
-        for fan in &fans {
-            if let Err(e) = fan.set_manual(false) {
-                eprintln!("Failed to release fan to SMC auto: {e}");
-            }
+    // Release every fan to SMC auto on exit (stop, restart, reboot, shutdown).
+    // The SMC firmware does not restore a perfectly clean auto curve after a
+    // fan has been under manual control regardless of when we release, so
+    // there is no benefit to deferring it; the service's ExecStopPost repeats
+    // this as a best-effort net in case the daemon is SIGKILLed first.
+    println!("T2 Fan Daemon is shutting down, releasing fans to SMC auto...");
+    for fan in &fans {
+        if let Err(e) = fan.set_manual(false) {
+            eprintln!("Failed to release fan to SMC auto: {e}");
         }
     }
 

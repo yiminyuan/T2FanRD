@@ -16,12 +16,7 @@ Fan Daemon for the Mac Pro 2019 (MacPro7,1), based on the [original version](htt
    sudo systemctl daemon-reload
    sudo systemctl enable --now t2fanrd.service
    ```
-   The unit runs `t2fanrd` as root with `Restart=always` and writes its PID to `/run/t2fand.pid`.
-3. Install the shutdown hook from `systemd/t2fanrd.shutdown` to `/usr/lib/systemd/system-shutdown/`:
-   ```
-   sudo install -m 0755 systemd/t2fanrd.shutdown /usr/lib/systemd/system-shutdown/t2fanrd.shutdown
-   ```
-   Runs at the very end of shutdown — after every service has stopped and every non-root mount has been unmounted — to release fans to SMC auto in a quiet moment just before kernel halt. No daemon-reload or service restart needed.
+   The unit runs `t2fanrd` as root with `Restart=always` and writes its PID to `/run/t2fand.pid`. On any exit — stop, restart, reboot, shutdown — the daemon hands the fans back to SMC auto; an `ExecStopPost` repeats this as a best-effort net in case the daemon is killed before it can.
 
 ## Configuration
 Initial configuration will be done automatically on first run.
