@@ -17,8 +17,9 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use fan_controller::{read_temp_file, FanController, SensorIdx, SensorPool};
+use fan_controller::{read_temp_file, FanController, NvidiaSensors, SensorIdx, SensorPool};
 use nonempty::NonEmpty as NonEmptyVec;
+use nvml_wrapper::Nvml;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use config::{load_fan_configs, FanConfig, SensorSpec};
@@ -156,16 +157,46 @@ fn is_display_controller(device_path: &Path) -> bool {
         .is_some_and(|class_byte| class_byte == 0x03)
 }
 
-/// Scan every GPU hwmon and attribute it to a single slot — the slot whose
-/// matching address appears closest to the PCI root in the device's canonical
-/// path. Disambiguates cards cross-connected via Infinity Fabric Link (whose
-/// dies show up downstream of multiple slots' sub-slot address lists).
-fn resolve_slot_attribution(slot_ids: &[String]) -> Result<HashMap<String, Vec<PathBuf>>> {
-    let mut slot_addresses: HashMap<String, Vec<String>> = HashMap::new();
-    for slot in slot_ids {
-        slot_addresses.insert(slot.clone(), read_slot_addresses(slot)?);
+/// Attribute a device's canonical sysfs path to a configured slot — the slot
+/// whose matching address appears closest to the PCI root (earliest match
+/// wins). Disambiguates devices reachable from more than one slot's address
+/// list, e.g. cards cross-connected via Infinity Fabric Link or GPUs behind a
+/// `PCIe` switch. The `.`-or-end boundary check stops `0000:0b:00` from
+/// matching `0000:0b:001`.
+fn slot_for_path<'a>(
+    real_path: &Path,
+    slot_addresses: &'a HashMap<String, Vec<String>>,
+) -> Option<&'a String> {
+    let real_path_str = real_path.to_string_lossy();
+    let components: Vec<&str> = real_path_str.split('/').collect();
+
+    let mut best: Option<(&String, usize)> = None;
+    for (slot_id, addresses) in slot_addresses {
+        let depth = components.iter().enumerate().find_map(|(d, c)| {
+            addresses
+                .iter()
+                .any(|addr| {
+                    c.starts_with(addr.as_str())
+                        && c.as_bytes().get(addr.len()).is_none_or(|&b| b == b'.')
+                })
+                .then_some(d)
+        });
+
+        if let Some(d) = depth {
+            if best.is_none_or(|(_, best_d)| d < best_d) {
+                best = Some((slot_id, d));
+            }
+        }
     }
 
+    best.map(|(slot_id, _)| slot_id)
+}
+
+/// Scan every GPU hwmon (AMD etc.) and attribute it to its owning slot. Returns
+/// slot -> hwmon `temp1_input` paths.
+fn resolve_slot_attribution(
+    slot_addresses: &HashMap<String, Vec<String>>,
+) -> Result<HashMap<String, Vec<PathBuf>>> {
     let mut slot_hwmons: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for hwmon_path in glob::glob("/sys/class/hwmon/hwmon*")?.filter_map(std::result::Result::ok) {
         let temp_input = hwmon_path.join("temp1_input");
@@ -182,33 +213,7 @@ fn resolve_slot_attribution(slot_ids: &[String]) -> Result<HashMap<String, Vec<P
             continue;
         }
 
-        let real_path_str = real_path.to_string_lossy();
-        let components: Vec<&str> = real_path_str.split('/').collect();
-
-        // For each configured slot, find the earliest depth at which any of
-        // its addresses matches a component (with the `.`-or-end boundary
-        // check so 0000:0b:00 doesn't match 0000:0b:001). The slot whose
-        // match is closest to the PCI root wins — that's the physical owner.
-        let mut best: Option<(&String, usize)> = None;
-        for (slot_id, addresses) in &slot_addresses {
-            let depth = components.iter().enumerate().find_map(|(d, c)| {
-                addresses
-                    .iter()
-                    .any(|addr| {
-                        c.starts_with(addr.as_str())
-                            && c.as_bytes().get(addr.len()).is_none_or(|&b| b == b'.')
-                    })
-                    .then_some(d)
-            });
-
-            if let Some(d) = depth {
-                if best.is_none_or(|(_, best_d)| d < best_d) {
-                    best = Some((slot_id, d));
-                }
-            }
-        }
-
-        if let Some((slot_id, _)) = best {
+        if let Some(slot_id) = slot_for_path(&real_path, slot_addresses) {
             slot_hwmons
                 .entry(slot_id.clone())
                 .or_default()
@@ -219,6 +224,83 @@ fn resolve_slot_attribution(slot_ids: &[String]) -> Result<HashMap<String, Vec<P
     Ok(slot_hwmons)
 }
 
+/// True if the PCI device is an NVIDIA (vendor `0x10de`) display controller
+/// (class `0x03`) — i.e. a GPU, excluding the card's HDMI-audio function.
+fn is_nvidia_gpu(device_path: &Path) -> bool {
+    let is_nvidia = std::fs::read_to_string(device_path.join("vendor"))
+        .ok()
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("0x10de"));
+    is_nvidia && is_display_controller(device_path)
+}
+
+/// Convert an NVML PCI bus id (`00000000:19:00.0`, 8-hex domain) to the sysfs
+/// form (`0000:19:00.0`, 4-hex domain) so it matches `/sys/bus/pci/devices/`.
+fn normalize_pci_addr(bus_id: &str) -> Option<String> {
+    let (domain, rest) = bus_id.split_once(':')?;
+    let domain = u32::from_str_radix(domain, 16).ok()?;
+    Some(format!("{domain:04x}:{}", rest.to_ascii_lowercase()))
+}
+
+/// Map of physical slot id -> NVML device indices of the NVIDIA GPUs it holds.
+type SlotNvidiaMap = HashMap<String, Vec<u32>>;
+
+/// Find NVIDIA GPUs that live in the configured slots and map each slot to the
+/// NVML device indices it holds. NVML is initialized only when a configured
+/// slot actually contains an NVIDIA GPU, so AMD-only systems never touch the
+/// NVIDIA driver. Returns the live NVML handle alongside the index map.
+fn resolve_slot_nvidia(
+    slot_addresses: &HashMap<String, Vec<String>>,
+) -> Result<(Option<Nvml>, SlotNvidiaMap)> {
+    // Attribute each NVIDIA GPU to its slot by canonical PCI path (same
+    // earliest-match rule as hwmon; the GPU may sit behind a PCIe switch).
+    let mut slot_gpu_addrs: HashMap<String, Vec<String>> = HashMap::new();
+    for dev in glob::glob("/sys/bus/pci/devices/*")?.filter_map(std::result::Result::ok) {
+        if !is_nvidia_gpu(&dev) {
+            continue;
+        }
+        let Ok(real_path) = std::fs::canonicalize(&dev) else {
+            continue;
+        };
+        let Some(addr) = dev.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(slot_id) = slot_for_path(&real_path, slot_addresses) {
+            slot_gpu_addrs
+                .entry(slot_id.clone())
+                .or_default()
+                .push(addr.to_owned());
+        }
+    }
+
+    if slot_gpu_addrs.is_empty() {
+        return Ok((None, HashMap::new()));
+    }
+
+    // NVIDIA present in a tracked slot -> bring up NVML, map address -> index.
+    let nvml = Nvml::init().map_err(Error::NvmlInit)?;
+    let count = nvml.device_count().map_err(Error::NvmlInit)?;
+    let mut addr_to_index: HashMap<String, u32> = HashMap::new();
+    for index in 0..count {
+        let device = nvml.device_by_index(index).map_err(Error::NvmlInit)?;
+        let bus_id = device.pci_info().map_err(Error::NvmlInit)?.bus_id;
+        if let Some(addr) = normalize_pci_addr(&bus_id) {
+            addr_to_index.insert(addr, index);
+        }
+    }
+
+    let mut slot_nvidia: HashMap<String, Vec<u32>> = HashMap::new();
+    for (slot_id, addrs) in &slot_gpu_addrs {
+        for addr in addrs {
+            let index = addr_to_index
+                .get(addr)
+                .ok_or_else(|| Error::SensorNotFound(format!("nvidia gpu at {addr}")))?;
+            slot_nvidia.entry(slot_id.clone()).or_default().push(*index);
+        }
+    }
+
+    Ok((Some(nvml), slot_nvidia))
+}
+
 /// Build the daemon-level `SensorPool` (each unique sensor opened once) plus
 /// per-fan `Vec<SensorIdx>` lists referencing the pool. Fans that share the
 /// same underlying hwmon path get the same index — read once per tick,
@@ -226,6 +308,8 @@ fn resolve_slot_attribution(slot_ids: &[String]) -> Result<HashMap<String, Vec<P
 fn build_sensor_setup(
     tracked_specs: &[Vec<SensorSpec>],
     slot_hwmons: &HashMap<String, Vec<PathBuf>>,
+    slot_nvidia: &SlotNvidiaMap,
+    nvml: Option<Nvml>,
 ) -> Result<(SensorPool, Vec<Vec<SensorIdx>>)> {
     let needs_cpu = tracked_specs
         .iter()
@@ -239,6 +323,8 @@ fn build_sensor_setup(
 
     let mut hwmons: Vec<std::fs::File> = Vec::new();
     let mut path_to_idx: HashMap<PathBuf, usize> = HashMap::new();
+    let mut nvidia_indices: Vec<u32> = Vec::new();
+    let mut nvml_to_pool: HashMap<u32, usize> = HashMap::new();
     let mut fan_idx_lists: Vec<Vec<SensorIdx>> = Vec::with_capacity(tracked_specs.len());
 
     for specs in tracked_specs {
@@ -247,10 +333,14 @@ fn build_sensor_setup(
             match spec {
                 SensorSpec::Cpu => idx_list.push(SensorIdx::Cpu),
                 SensorSpec::Slot(n) => {
-                    let paths = slot_hwmons
-                        .get(n)
-                        .ok_or_else(|| Error::SensorNotFound(format!("slot:{n}")))?;
-                    for path in paths {
+                    let hwmon_paths = slot_hwmons.get(n);
+                    let nvidia_idxs = slot_nvidia.get(n);
+                    if hwmon_paths.is_none() && nvidia_idxs.is_none() {
+                        return Err(Error::SensorNotFound(format!("slot:{n}")));
+                    }
+
+                    // AMD / hwmon dies in this slot.
+                    for path in hwmon_paths.into_iter().flatten() {
                         let idx = if let Some(&i) = path_to_idx.get(path) {
                             i
                         } else {
@@ -262,13 +352,40 @@ fn build_sensor_setup(
                         };
                         idx_list.push(SensorIdx::Hwmon(idx));
                     }
+
+                    // NVIDIA GPUs in this slot (read via NVML).
+                    for &nvml_index in nvidia_idxs.into_iter().flatten() {
+                        let pool_idx = if let Some(&i) = nvml_to_pool.get(&nvml_index) {
+                            i
+                        } else {
+                            nvidia_indices.push(nvml_index);
+                            let i = nvidia_indices.len() - 1;
+                            nvml_to_pool.insert(nvml_index, i);
+                            i
+                        };
+                        idx_list.push(SensorIdx::Nvidia(pool_idx));
+                    }
                 }
             }
         }
         fan_idx_lists.push(idx_list);
     }
 
-    Ok((SensorPool { cpu_file, hwmons }, fan_idx_lists))
+    let nvidia = if nvidia_indices.is_empty() {
+        None
+    } else {
+        let nvml = nvml.ok_or_else(|| Error::SensorNotFound("nvidia (NVML unavailable)".to_owned()))?;
+        Some(NvidiaSensors::new(nvml, nvidia_indices))
+    };
+
+    Ok((
+        SensorPool {
+            cpu_file,
+            hwmons,
+            nvidia,
+        },
+        fan_idx_lists,
+    ))
 }
 
 fn release_fan_to_smc(fan_path: &Path) -> Result<()> {
@@ -296,7 +413,7 @@ struct FanTempTracker {
 }
 
 fn start_temp_loop(
-    sensor_pool: &SensorPool,
+    sensor_pool: &mut SensorPool,
     fans: &mut NonEmptyVec<FanController>,
     auto_pattern: &[bool],
     fan_count: std::num::NonZeroUsize,
@@ -461,11 +578,19 @@ fn real_main() -> Result<()> {
         }
         set.into_iter().collect()
     };
-    let slot_hwmons = resolve_slot_attribution(&unique_slots)?;
+    // Read each tracked slot's PCI addresses once; both AMD-hwmon and
+    // NVIDIA-NVML resolution match against the same address lists.
+    let mut slot_addresses: HashMap<String, Vec<String>> = HashMap::new();
+    for slot in &unique_slots {
+        slot_addresses.insert(slot.clone(), read_slot_addresses(slot)?);
+    }
+    let slot_hwmons = resolve_slot_attribution(&slot_addresses)?;
+    let (nvml, slot_nvidia) = resolve_slot_nvidia(&slot_addresses)?;
 
     let tracked_specs: Vec<Vec<SensorSpec>> =
         tracked.iter().map(|(_, c)| c.sensors.clone()).collect();
-    let (sensor_pool, fan_idx_lists) = build_sensor_setup(&tracked_specs, &slot_hwmons)?;
+    let (mut sensor_pool, fan_idx_lists) =
+        build_sensor_setup(&tracked_specs, &slot_hwmons, &slot_nvidia, nvml)?;
     println!("Sensor pool: {sensor_pool:#?}");
 
     let fans: Vec<FanController> = tracked
@@ -481,7 +606,7 @@ fn real_main() -> Result<()> {
         fan.set_manual(true)?;
     }
 
-    let res = start_temp_loop(&sensor_pool, &mut fans, &auto_pattern, fan_count);
+    let res = start_temp_loop(&mut sensor_pool, &mut fans, &auto_pattern, fan_count);
 
     // Release every fan to SMC auto on exit (stop, restart, reboot, shutdown).
     // The SMC firmware does not restore a perfectly clean auto curve after a

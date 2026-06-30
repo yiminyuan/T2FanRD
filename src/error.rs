@@ -57,6 +57,11 @@ pub enum Error {
     #[error("Sensor {0} not found")]
     SensorNotFound(String),
 
+    #[error("Cannot initialize NVML (is the NVIDIA driver loaded?)")]
+    NvmlInit(#[source] nvml_wrapper::error::NvmlError),
+    #[error("Cannot read NVIDIA GPU temperature via NVML")]
+    NvmlRead(#[source] nvml_wrapper::error::NvmlError),
+
     #[error("All fans are configured with auto=true; t2fanrd has nothing to control")]
     AllFansAuto,
 

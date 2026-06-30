@@ -59,9 +59,11 @@ Here's an image to better explain the speed curves. (Red: linear, blue: exponent
 The `sensors` key declares which temperature sensors drive the fan. The fan responds to the highest temperature across every entry in the list. The supported entry formats are:
 
 - `cpu` — read from `/sys/devices/platform/coretemp.0/hwmon/hwmon*/temp1_input`.
-- `slot:<N>` — read every **GPU** hwmon `temp1_input` downstream of physical slot `<N>` (as listed in `/sys/bus/pci/slots/`). Only devices with PCI class `0x03` (display controllers) are matched, so incidental devices in the slot's sub-tree (ethernet, audio, NVMe) are ignored. Multi-die GPUs (e.g. the W6800X Duo) expose one `temp1_input` per die; all of them are included automatically.
+- `slot:<N>` — read every **GPU** in physical slot `<N>` (as listed in `/sys/bus/pci/slots/`). AMD and other GPUs are read from their hwmon `temp1_input`; **NVIDIA** GPUs — which expose no hwmon temperature — are read via **NVML**. Only display controllers (PCI class `0x03`) are matched, so incidental devices in the slot's sub-tree (ethernet, audio, NVMe) are ignored. Multi-die GPUs (e.g. the W6800X Duo) expose one sensor per die; all of them are included automatically.
 
-The two formats can be combined, e.g. `sensors=cpu,slot:1` for a fan that should respond to whichever is hotter between CPU and slot 1.
+The two formats can be combined, e.g. `sensors=cpu,slot:1` for a fan that should respond to whichever is hotter between CPU and slot 1. A single slot may even mix sources — `sensors=slot:3,slot:5` where slot 3 holds an AMD module and slot 5 an NVIDIA card resolves to the max of all of them.
+
+**NVIDIA support** uses NVML (`libnvidia-ml.so`, shipped with the NVIDIA driver). NVML is initialized only when a configured slot actually contains an NVIDIA GPU, so AMD-only systems are untouched and the daemon still builds and runs without the NVIDIA libraries present. Because an NVIDIA GPU runs its own VBIOS-controlled fan and our case fan only supplies fresh intake air, NVIDIA temperature is sampled at a low rate (every 2 s) and cached between reads — this never slows the reactive 10 Hz loop the fanless CPU and AMD GPUs depend on.
 
 `sensors` is **mandatory** when `auto=false`; the daemon refuses to start otherwise. (When `auto=true`, the fan stays on SMC and `sensors` is ignored.)
 
@@ -73,7 +75,7 @@ ls /sys/bus/pci/slots/
 ```
 
 ### Example
-Config for a Mac Pro 2019 with dual W6800X Duo MPX modules in slots 1 and 3. Fan 2 is assigned to the MPX module in slot 1, and Fan 3 to the MPX module in slot 3. Each slot contains two GPU dies, and the fan responds to whichever die is hotter.
+Config for a Mac Pro 2019 with dual W6800X Duo MPX modules in slots 1 and 3, plus an NVIDIA add-in GPU in slot 5. Fan 2 cools the slot-1 module; Fan 3 cools the slot-3 module **and** the NVIDIA GPU (whichever is hottest); Fan 4 follows the CPU. Each MPX slot contains two GPU dies, and the fan responds to whichever sensor is hottest across its list.
 
 ```ini
 # Rear exhaust fan
@@ -90,14 +92,14 @@ always_full_speed=false
 sensors=slot:1
 exp_pow=3.0
 
-# Front intake fan - middle
+# Front intake fan - middle (slot 3 AMD module + slot 5 NVIDIA GPU)
 [Fan3]
 auto=false
 low_temp=50
 high_temp=85
 speed_curve=exponential
 always_full_speed=false
-sensors=slot:3
+sensors=slot:3,slot:5
 exp_pow=3.0
 
 # Front intake fan - top

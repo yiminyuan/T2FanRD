@@ -2,12 +2,22 @@ use std::{
     io::{IsTerminal, Write},
     os::unix::fs::FileExt,
     path::PathBuf,
+    time::{Duration, Instant},
 };
+
+use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
 
 use crate::{
     config::{FanConfig, SpeedCurve},
     error::{Error, Result},
 };
+
+// NVIDIA GPUs cool themselves with their own VBIOS-controlled fan; the case
+// fans we drive only supply fresh intake air (a slow ambient-assist role). So
+// we sample NVML at a low rate and reuse the cached value between reads,
+// keeping the reactive 10 Hz loop (for the fanless CPU / AMD GPUs) free of
+// NVML ioctls.
+const NVML_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(crate) fn read_temp_file(temp_file: &std::fs::File) -> Result<u8> {
     let mut buf = [0u8; 16];
@@ -21,25 +31,82 @@ pub(crate) fn read_temp_file(temp_file: &std::fs::File) -> Result<u8> {
 pub enum SensorIdx {
     Cpu,
     Hwmon(usize),
+    Nvidia(usize),
 }
 
-/// Daemon-level pool of unique sensor file handles. Each unique CPU /
-/// hwmon `temp1_input` is opened once and read once per tick, regardless of
-/// how many fans reference it.
+/// NVML handle plus the unique GPU indices to sample. Reads are throttled to
+/// `NVML_MIN_INTERVAL` and cached: the case fan's effect on GPU intake air is
+/// slow, the GPU runs its own fan, and there is no reason to stress the
+/// NVIDIA driver at the control loop's 10 Hz.
+pub struct NvidiaSensors {
+    nvml: Nvml,
+    indices: Vec<u32>,
+    cache: Vec<u8>,
+    last_read: Option<Instant>,
+}
+
+// `Nvml` is not `Debug`; show only the GPU indices so `SensorPool` can derive
+// `Debug` (the startup pool dump).
+impl std::fmt::Debug for NvidiaSensors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NvidiaSensors")
+            .field("indices", &self.indices)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NvidiaSensors {
+    pub fn new(nvml: Nvml, indices: Vec<u32>) -> Self {
+        let cache = vec![0u8; indices.len()];
+        Self {
+            nvml,
+            indices,
+            cache,
+            last_read: None,
+        }
+    }
+
+    /// Refresh the cached GPU temperatures if the throttle interval has elapsed
+    /// (or on the first call), then hand back the cache.
+    fn read(&mut self) -> Result<&[u8]> {
+        let now = Instant::now();
+        let due = self
+            .last_read
+            .is_none_or(|t| now.duration_since(t) >= NVML_MIN_INTERVAL);
+        if due {
+            for (slot, &index) in self.cache.iter_mut().zip(&self.indices) {
+                let device = self.nvml.device_by_index(index).map_err(Error::NvmlRead)?;
+                let temp = device
+                    .temperature(TemperatureSensor::Gpu)
+                    .map_err(Error::NvmlRead)?;
+                *slot = temp.min(u32::from(u8::MAX)) as u8;
+            }
+            self.last_read = Some(now);
+        }
+        Ok(&self.cache)
+    }
+}
+
+/// Daemon-level pool of unique sensor handles. Each unique CPU / hwmon
+/// `temp1_input` is opened once and read once per tick; NVIDIA GPUs are read
+/// through a single shared NVML handle, throttled. Regardless of how many fans
+/// reference a sensor, it is read once per tick.
 #[derive(Debug)]
 pub struct SensorPool {
     pub cpu_file: Option<std::fs::File>,
     pub hwmons: Vec<std::fs::File>,
+    pub nvidia: Option<NvidiaSensors>,
 }
 
 #[derive(Debug)]
 pub struct SensorReadings {
     pub cpu: Option<u8>,
     pub hwmons: Vec<u8>,
+    pub nvidia: Vec<u8>,
 }
 
 impl SensorPool {
-    pub fn read_all(&self) -> Result<SensorReadings> {
+    pub fn read_all(&mut self) -> Result<SensorReadings> {
         let cpu = match &self.cpu_file {
             Some(f) => Some(read_temp_file(f)?),
             None => None,
@@ -48,7 +115,15 @@ impl SensorPool {
         for f in &self.hwmons {
             hwmons.push(read_temp_file(f)?);
         }
-        Ok(SensorReadings { cpu, hwmons })
+        let nvidia = match &mut self.nvidia {
+            Some(nv) => nv.read()?.to_vec(),
+            None => Vec::new(),
+        };
+        Ok(SensorReadings {
+            cpu,
+            hwmons,
+            nvidia,
+        })
     }
 }
 
@@ -133,6 +208,7 @@ impl FanController {
                     .cpu
                     .expect("CPU sensor configured but CPU temp not read"),
                 SensorIdx::Hwmon(i) => readings.hwmons[*i],
+                SensorIdx::Nvidia(i) => readings.nvidia[*i],
             };
             max_temp = max_temp.max(temp);
         }
